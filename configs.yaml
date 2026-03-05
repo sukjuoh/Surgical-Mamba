@@ -19,7 +19,7 @@ model:
   # ── Clip hint tokens ──────────────────────────────────────────────────────
   # Learnable queries cross-attend with VMamba features to produce
   # N_hints clip-level summary tokens, prepended before visual tokens.
-  n_hints: 12                       # number of ClipHint tokens per clip
+  n_hints: 20                       # number of ClipHint tokens per clip
 
   # ── Cross-clip temporal memory (CrossClipMemory) ─────────────────────────
   # A Mamba SSM compresses current hint tokens + previous clip's memory into

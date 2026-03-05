@@ -29,7 +29,7 @@ Architecture (per clip):
     – tokenized + embedded with frozen LLM embedding layer
                      │
                      ▼
-  LLM input: [memory_prev (detached, N_hints) | tool_text_emb | hint_tokens | visual_tokens]
+  LLM input: [attended_memory(N_hints) | tool_text_emb | hint_tokens | visual_tokens]
   with past_key_values = prompt_kv (fixed, computed once per video)
                      │
                      ▼ Frozen LLM
@@ -51,7 +51,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 from .vmamba_extractor import VMambaTinyExtractor
 from .reprogramming import ReprogrammingLayer
 from .clip_hint import ClipHintEncoder
-from .temporal_mamba import TemporalRefiner, CrossClipMemory
+from .temporal_mamba import TemporalRefiner, CrossClipMemory, MemoryFusion
 
 
 CHOLEC80_PHASES = [
@@ -240,10 +240,12 @@ class SurgicalPhaseLLM(nn.Module):
         self._prompt_kv: tuple = None
 
         # ── 7. Cross-clip memory (SSM-based) ─────────────────────────────────
-        # Replaces raw hidden-state context with a learned Mamba compression
-        # of hint tokens. Each clip: memory = CrossClipMemory(hints, prev_memory)
-        # The memory (B, N_hints, d_llm) is prepended to the NEXT clip's LLM input.
+        # Each clip: memory = CrossClipMemory(hints, prev_memory)
+        # memory is NOT prepended to LLM input directly — instead it is fused
+        # into visual_tokens via MemoryFusion (cross-attention), keeping LLM
+        # sequence length fixed.
         self.cross_clip_memory = CrossClipMemory(d_model=self.d_llm)
+        self.memory_fusion = MemoryFusion(d_model=self.d_llm, n_heads=n_heads)
 
         # ── 8. Output head ───────────────────────────────────────────────────
         self.output_dropout = nn.Dropout(output_dropout)
@@ -372,15 +374,20 @@ class SurgicalPhaseLLM(nn.Module):
 
         # 4b. Cross-clip memory update ────────────────────────────────────────
         # Mamba integrates current hints with previous clip's memory.
-        # new_memory is used as LLM prefix for the NEXT clip (detached).
-        # memory (prev clip's output) is used as prefix for THIS clip's LLM.
+        # new_memory will be passed to the NEXT clip (detached).
         new_memory = self.cross_clip_memory(hints, memory)              # (B, N_hints, d_llm)
 
+        # 4c. Memory-attended context ─────────────────────────────────────────
+        # Q=memory(past), K/V=visual_tokens(current) → (B, N_hints, d_llm)
+        # Past memory queries the current visual to surface history-relevant info.
+        # Prepended to LLM input as a dedicated prefix, visual_tokens stay intact.
+        attended_memory = self.memory_fusion(memory, visual_tokens) if memory is not None else None
+
         # 5. Build LLM input sequence ─────────────────────────────────────────
-        # [memory_prev (detached, N_hints) | tool_text_emb | hint_tokens | visual_tokens]
+        # [attended_memory(N_hints) | tool_text_emb | hint_tokens | visual_tokens]
         parts = []
-        if memory is not None:
-            parts.append(memory)  # previous clip's compressed memory (N_hints tokens)
+        if attended_memory is not None:
+            parts.append(attended_memory)
         if tool_annots is not None:
             parts.append(self._make_tool_emb(tool_annots))
         parts.append(hints)

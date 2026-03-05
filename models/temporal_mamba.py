@@ -130,6 +130,49 @@ class CrossClipMemory(nn.Module):
         return memory
 
 
+class MemoryFusion(nn.Module):
+    """
+    Cross-attention: memory queries into current visual tokens.
+
+    Past-clip memory acts as queries (Q) to extract relevant information
+    from the current clip's visual tokens (K/V). The output (N_hints tokens)
+    is prepended to the LLM input — giving the LLM a history-grounded view
+    of the current clip, distinct from the raw visual tokens.
+
+        Q = memory         (B, N, d_model)   — past clips summary (detached)
+        K = V = visual     (B, T, d_model)   — current clip visual tokens
+        Output             (B, N, d_model)   — what current clip offers to past memory
+
+    LLM input: [attended_memory(N) | tool_text | hints | visual_tokens]
+
+    Args:
+        d_model:  feature dimension (= d_llm)
+        n_heads:  number of attention heads
+        dropout:  attention dropout
+    """
+
+    def __init__(self, d_model: int, n_heads: int = 8, dropout: float = 0.0):
+        super().__init__()
+        self.q_norm  = nn.LayerNorm(d_model)
+        self.kv_norm = nn.LayerNorm(d_model)
+        self.cross_attn = nn.MultiheadAttention(
+            d_model, n_heads, dropout=dropout, batch_first=True
+        )
+        self.out_norm = nn.LayerNorm(d_model)
+
+    def forward(self, memory: torch.Tensor, visual_tokens: torch.Tensor) -> torch.Tensor:
+        """
+        memory:        (B, N, d_model) — previous clip's memory (detached), used as Q
+        visual_tokens: (B, T, d_model) — current clip's visual tokens, used as K/V
+
+        Returns: (B, N, d_model) — memory queries answered by current visual content
+        """
+        q  = self.q_norm(memory)
+        kv = self.kv_norm(visual_tokens)
+        attn_out, _ = self.cross_attn(q, kv, kv)
+        return self.out_norm(memory + attn_out)
+
+
 class TemporalRefiner(nn.Module):
     """
     Stack of N bidirectional Mamba blocks for temporal refinement of visual tokens.
