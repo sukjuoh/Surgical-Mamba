@@ -79,6 +79,57 @@ class TemporalMambaBlock(nn.Module):
         return x
 
 
+class CrossClipMemory(nn.Module):
+    """
+    SSM-based cross-clip temporal memory.
+
+    Each clip, hint tokens are fed through a Mamba layer conditioned on the
+    previous clip's memory, producing an updated memory that summarizes all
+    clips seen so far. This memory is used as context prefix for the LLM in
+    the NEXT clip, replacing the raw hidden-state truncation approach.
+
+    Design:
+      - Input: [prev_memory | current_hints] concatenated along sequence dim
+      - Mamba processes left-to-right (causal SSM), so current positions attend
+        to all previous positions including past-clip memory
+      - Output: last N_hints positions = updated memory (residual with hints)
+
+    Args:
+        d_model:  feature dimension (= d_llm)
+        d_state:  SSM state size
+        d_conv:   depthwise conv kernel size
+        expand:   inner dimension expansion factor
+    """
+
+    def __init__(self, d_model: int, d_state: int = 16, d_conv: int = 4, expand: int = 2):
+        super().__init__()
+        self.norm = nn.LayerNorm(d_model)
+        self.mamba = Mamba(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)
+        self.out_norm = nn.LayerNorm(d_model)
+
+    def forward(self, hints: torch.Tensor, prev_memory: torch.Tensor = None) -> torch.Tensor:
+        """
+        hints:       (B, N_hints, d_model) — current clip's hint tokens
+        prev_memory: (B, N_hints, d_model) or None — previous clip's memory (detached)
+
+        Returns:
+            memory: (B, N_hints, d_model) — updated memory for next clip
+        """
+        if prev_memory is not None:
+            # Prepend prev_memory so Mamba can condition current hints on past clips
+            x = torch.cat([prev_memory, hints], dim=1)  # (B, 2*N, d)
+        else:
+            x = hints  # (B, N, d)
+
+        # Residual SSM: Mamba integrates temporal context left-to-right
+        x = x + self.mamba(self.norm(x))
+
+        # Take the last N_hints positions: updated representation of current clip
+        N = hints.shape[1]
+        memory = self.out_norm(x[:, -N:, :])  # (B, N_hints, d)
+        return memory
+
+
 class TemporalRefiner(nn.Module):
     """
     Stack of N bidirectional Mamba blocks for temporal refinement of visual tokens.

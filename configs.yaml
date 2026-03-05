@@ -21,11 +21,10 @@ model:
   # N_hints clip-level summary tokens, prepended before visual tokens.
   n_hints: 12                       # number of ClipHint tokens per clip
 
-  # ── Temporal context (Detached Context Prefix) ────────────────────────────
-  # Number of previous-clip LLM hidden states to prepend as context.
-  # These are detached (no gradient), giving cross-clip temporal continuity
-  # without BPTT cost.
-  context_len: 48                  # K: frames carried over from previous clip
+  # ── Cross-clip temporal memory (CrossClipMemory) ─────────────────────────
+  # A Mamba SSM compresses current hint tokens + previous clip's memory into
+  # an updated memory (B, N_hints, d_llm), prepended to the next clip's LLM
+  # input. Replaces raw hidden-state truncation; memory size = n_hints tokens.
 
   # ── Freeze settings ───────────────────────────────────────────────────────
   freeze_llm: true                 # keep LLM weights frozen
@@ -80,7 +79,7 @@ data:
   phase_annotation_dir: "phase_annotations_preprocessed"
   tool_annotation_dir: "tool_annotations_1fps"
   img_size: 224
-  seq_len: 192                     # T: number of frames (tokens) per clip
+  seq_len: 256                     # T: number of frames (tokens) per clip
   num_phases: 7
 
   # CholecT80 standard split

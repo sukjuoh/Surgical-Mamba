@@ -197,7 +197,7 @@ def run_video(
 
     # Build prompt KV once per video (fixed prompt, reused across all clips)
     prompt_kv = model.build_prompt_kv()
-    context   = None
+    memory    = None  # CrossClipMemory state, reset per video
 
     for frames, tools, labels, valid_mask in loader:
         # frames:     (1, T, 3, H, W)
@@ -214,10 +214,10 @@ def run_video(
 
         with torch.set_grad_enabled(is_train):
             with autocast("cuda", enabled=(scaler is not None)):
-                logits, context, hints, attn_loss = model.forward_clip(
+                logits, memory, hints, attn_loss = model.forward_clip(
                     frames     = frames,
                     tool_annots= tools,
-                    context    = context,
+                    memory     = memory,
                     prompt_kv  = prompt_kv,
                 )
                 loss_ce     = masked_ce_loss(logits, labels, valid_mask,

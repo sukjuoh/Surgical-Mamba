@@ -29,7 +29,7 @@ Architecture (per clip):
     – tokenized + embedded with frozen LLM embedding layer
                      │
                      ▼
-  LLM input: [context_prev (detached, ≤K) | tool_text_emb | hint_tokens | visual_tokens]
+  LLM input: [memory_prev (detached, N_hints) | tool_text_emb | hint_tokens | visual_tokens]
   with past_key_values = prompt_kv (fixed, computed once per video)
                      │
                      ▼ Frozen LLM
@@ -40,7 +40,7 @@ Architecture (per clip):
                      ▼ output_head
   logits (B, T, num_phases)
 
-  + return new_context = hidden[:, -T:, :].detach()
+  + memory_new = CrossClipMemory(hints, memory_prev)  → passed to next clip (detached)
 """
 
 import torch
@@ -51,7 +51,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 from .vmamba_extractor import VMambaTinyExtractor
 from .reprogramming import ReprogrammingLayer
 from .clip_hint import ClipHintEncoder
-from .temporal_mamba import TemporalRefiner
+from .temporal_mamba import TemporalRefiner, CrossClipMemory
 
 
 CHOLEC80_PHASES = [
@@ -135,7 +135,6 @@ class SurgicalPhaseLLM(nn.Module):
         d_ff:               output bottleneck dimension
         num_tokens:         vocabulary reduction for reprogramming K/V
         n_hints:            number of ClipHint tokens per clip
-        context_len:        max frames carried over from previous clip
         prompt:             task description text prefix
         attention_dropout:  dropout in ReprogrammingLayer
         hint_dropout:       dropout in ClipHintEncoder
@@ -154,14 +153,12 @@ class SurgicalPhaseLLM(nn.Module):
         d_ff: int = 256,
         num_tokens: int = 1000,
         n_hints: int = 8,
-        context_len: int = 30,
         prompt: str = _DEFAULT_PROMPT,
         attention_dropout: float = 0.1,
         hint_dropout: float = 0.1,
         output_dropout: float = 0.1,
     ):
         super().__init__()
-        self.context_len = context_len
         self.d_ff = d_ff
         self.n_hints = n_hints
 
@@ -208,7 +205,7 @@ class SurgicalPhaseLLM(nn.Module):
             d_llm=self.d_llm,
             attention_dropout=attention_dropout,
         )
-        self.register_buffer("word_embeddings", word_emb_weight.detach())
+        self.register_buffer("word_embeddings", word_emb_weight.detach().float())
 
         # Fusion + FFN (transformer-style projector block)
         self.visual_norm1 = nn.LayerNorm(self.d_llm)
@@ -242,7 +239,13 @@ class SurgicalPhaseLLM(nn.Module):
         self.prompt_len = prompt_emb.shape[1]
         self._prompt_kv: tuple = None
 
-        # ── 7. Output head ───────────────────────────────────────────────────
+        # ── 7. Cross-clip memory (SSM-based) ─────────────────────────────────
+        # Replaces raw hidden-state context with a learned Mamba compression
+        # of hint tokens. Each clip: memory = CrossClipMemory(hints, prev_memory)
+        # The memory (B, N_hints, d_llm) is prepended to the NEXT clip's LLM input.
+        self.cross_clip_memory = CrossClipMemory(d_model=self.d_llm)
+
+        # ── 8. Output head ───────────────────────────────────────────────────
         self.output_dropout = nn.Dropout(output_dropout)
         self.output_head = nn.Linear(d_ff, num_phases)
 
@@ -322,7 +325,7 @@ class SurgicalPhaseLLM(nn.Module):
         self,
         frames: torch.Tensor,
         tool_annots: torch.Tensor = None,
-        context: torch.Tensor = None,
+        memory: torch.Tensor = None,
         prompt_kv: tuple = None,
     ):
         """
@@ -331,12 +334,13 @@ class SurgicalPhaseLLM(nn.Module):
         Args:
             frames:      (B, T, 3, H, W)
             tool_annots: (B, T, 7) binary/float tool presence, optional
-            context:     (B, K, d_llm) detached hidden states from previous clip
+            memory:      (B, N_hints, d_llm) detached CrossClipMemory output from
+                         previous clip; prepended to LLM input as temporal context
             prompt_kv:   cached KV from build_prompt_kv(); uses self._prompt_kv if None
 
         Returns:
             logits:          (B, T, num_phases)
-            new_context:     (B, T, d_llm) detached – pass as context for next clip
+            new_memory:      (B, N_hints, d_llm) detached – pass as memory for next clip
             hints:           (B, N_hints, d_llm) – for hint diversity loss
             attn_focus_loss: scalar – attention focus loss from hint encoder
         """
@@ -366,17 +370,24 @@ class SurgicalPhaseLLM(nn.Module):
         # 4. Clip hint tokens ─────────────────────────────────────────────────
         hints, attn_focus_loss = self.hint_encoder(feats)               # (B, N_hints, d_llm)
 
+        # 4b. Cross-clip memory update ────────────────────────────────────────
+        # Mamba integrates current hints with previous clip's memory.
+        # new_memory is used as LLM prefix for the NEXT clip (detached).
+        # memory (prev clip's output) is used as prefix for THIS clip's LLM.
+        new_memory = self.cross_clip_memory(hints, memory)              # (B, N_hints, d_llm)
+
         # 5. Build LLM input sequence ─────────────────────────────────────────
-        # [context (detached, ≤K) | tool_text_emb | hint_tokens | visual_tokens]
+        # [memory_prev (detached, N_hints) | tool_text_emb | hint_tokens | visual_tokens]
         parts = []
-        if context is not None:
-            parts.append(context[:, -self.context_len:, :])
+        if memory is not None:
+            parts.append(memory)  # previous clip's compressed memory (N_hints tokens)
         if tool_annots is not None:
             parts.append(self._make_tool_emb(tool_annots))
         parts.append(hints)
         parts.append(visual_tokens)
 
-        llm_input = torch.cat(parts, dim=1)                           # (B, *, d_llm)
+        llm_dtype = next(self.llm.parameters()).dtype
+        llm_input = torch.cat([p.to(llm_dtype) for p in parts], dim=1)  # (B, *, d_llm)
 
         # 6. Frozen LLM forward ───────────────────────────────────────────────
         # Fresh DynamicCache each clip so the stored prompt tensors are not
@@ -395,11 +406,10 @@ class SurgicalPhaseLLM(nn.Module):
         hidden = lm_out.hidden_states[-1]                             # (B, *, d_llm)
 
         # 7. Extract frame positions and predict ──────────────────────────────
-        frame_hidden = hidden[:, -T:, :self.d_ff]                     # (B, T, d_ff)
+        frame_hidden = hidden[:, -T:, :self.d_ff].float()             # (B, T, d_ff)
         logits = self.output_head(self.output_dropout(frame_hidden))  # (B, T, num_phases)
-        new_context = hidden[:, -T:, :].detach()                      # (B, T, d_llm)
 
-        return logits, new_context, hints, attn_focus_loss
+        return logits, new_memory.detach(), hints, attn_focus_loss
 
     # ── Convenience ──────────────────────────────────────────────────────────
 
@@ -427,7 +437,6 @@ class SurgicalPhaseLLM(nn.Module):
             d_ff             = m.d_ff,
             num_tokens       = m.num_tokens,
             n_hints          = m.n_hints,
-            context_len      = m.context_len,
             prompt           = m.prompt,
             attention_dropout= m.attention_dropout,
             hint_dropout     = m.hint_dropout,
