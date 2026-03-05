@@ -19,7 +19,7 @@ model:
   # ── Clip hint tokens ──────────────────────────────────────────────────────
   # Learnable queries cross-attend with VMamba features to produce
   # N_hints clip-level summary tokens, prepended before visual tokens.
-  n_hints: 20                       # number of ClipHint tokens per clip
+  n_hints: 12                       # number of ClipHint tokens per clip
 
   # ── Cross-clip temporal memory (CrossClipMemory) ─────────────────────────
   # A Mamba SSM compresses current hint tokens + previous clip's memory into
@@ -95,7 +95,7 @@ data:
   phase_annotation_dir: "phase_annotations_preprocessed"
   tool_annotation_dir: "tool_annotations_preprocessed"
   img_size: 224
-  seq_len: 192                     # T: number of frames (tokens) per clip
+  seq_len: 128                     # T: number of frames (tokens) per clip
   num_phases: 7
 
   # CholecT80 standard split
