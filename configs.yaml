@@ -12,9 +12,11 @@ model:
   d_ff: 256                        # output bottleneck (first d_ff dims of LLM hidden states)
   num_tokens: 1000                 # vocabulary reduction for reprogramming K/V (Qwen vocab=151936)
 
-  # ── Temporal Mamba refiner ────────────────────────────────────────────────
-  # Mamba2 1D temporal refinement applied to VMamba features before reprogramming.
-  mamba_layers: 1                  # number of stacked Mamba2 blocks (0 = disabled)
+  # ── Temporal refiner (Causal Depthwise Conv) ─────────────────────────────
+  # Replaced bidirectional Mamba with causal depthwise conv for zero
+  # train/inference gap — identical behavior in batch and online (buffer) mode.
+  mamba_layers: 1                  # number of stacked CausalConvBlocks
+  conv_kernel_size: 15             # temporal receptive field per block (frames)
 
   # ── Clip hint tokens ──────────────────────────────────────────────────────
   # Learnable queries cross-attend with VMamba features to produce

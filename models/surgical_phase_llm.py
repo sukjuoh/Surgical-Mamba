@@ -165,6 +165,7 @@ class SurgicalPhaseLLM(nn.Module):
         num_tokens: int = 1000,
         n_hints: int = 8,
         local_context_ratio: int = 4,
+        conv_kernel_size: int = 15,
         prompt: str = _DEFAULT_PROMPT,
         attention_dropout: float = 0.1,
         hint_dropout: float = 0.1,
@@ -189,6 +190,7 @@ class SurgicalPhaseLLM(nn.Module):
         self.temporal_refiner = TemporalRefiner(
             d_model=self.d_visual,
             num_layers=mamba_layers,
+            conv_kernel_size=conv_kernel_size,
         )
 
         # ── 3. LLM (frozen by default) ───────────────────────────────────────
@@ -464,6 +466,7 @@ class SurgicalPhaseLLM(nn.Module):
             num_tokens       = m.num_tokens,
             n_hints          = m.n_hints,
             local_context_ratio = m.local_context_ratio,
+            conv_kernel_size    = m.conv_kernel_size,
             prompt           = m.prompt,
             attention_dropout= m.attention_dropout,
             hint_dropout     = m.hint_dropout,

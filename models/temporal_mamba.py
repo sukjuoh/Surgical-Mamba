@@ -1,64 +1,89 @@
 """
-Temporal Mamba refiner for 1D visual token sequences.
+Temporal refinement for 1D visual token sequences.
 
-Wraps mamba_ssm.Mamba to process (B, T, d_model) temporal sequences.
-Stacked N layers with pre-norm residual connections, applied BEFORE the
-LLM reprogramming step to capture temporal dependencies across frames.
+CausalConvBlock replaces the previous bidirectional Mamba block.
 
-Why Mamba here:
-  - Visual tokens from VMamba are spatially rich but temporally independent
-    (each frame processed independently by the extractor).
-  - A causal SSM refiner lets each frame's representation attend to ALL
-    previous frames with O(T) complexity — ideal for surgical video where
-    phase identity depends on what happened earlier in the clip.
-  - Bidirectional mode: forward + backward Mamba so each token sees the
-    full clip context in both directions before being sent to the LLM.
+Why Causal Depthwise Conv:
+  - Zero train/inference gap: causal conv behaves identically during
+    offline (batch) training and online (frame-by-frame) inference.
+    Online step only requires maintaining a rolling buffer of
+    (kernel_size - 1) past frames — no SSM state or mode switching.
+  - Speed: depthwise conv on (B, 768, T) is microseconds vs Mamba's
+    custom CUDA kernel overhead. Pointwise mix adds negligible cost.
+  - Local context (kernel_size=15 → 15-frame receptive field) is
+    sufficient here because the LLM and CrossClipMemory already model
+    long-range temporal dependencies across the full clip and video.
+  - Frame-delta injection provides explicit motion signal for transitions,
+    complementing the conv's local smoothing.
 
-Enhancements over a plain Mamba stack:
-  1. True bidirectional scan — forward Mamba + backward Mamba (flipped),
-     merged by a linear projection. Each frame sees both past and future.
-  2. FFN after each SSM block — post-SSM MLP (pre-norm, GELU) improves
-     per-token feature expressiveness, following the Mamba-2 / Jamba recipe.
-  3. Frame-delta injection — x[t] - x[t-1] encodes local visual motion,
-     which is a strong signal for detecting surgical phase transitions.
+Online inference buffer:
+  At each new frame t, maintain feat_buffer (deque, maxlen=kernel_size-1).
+  Prepend buffered frames → conv → take the last output position.
+  No retraining needed; behavior is mathematically identical to batch mode.
+
+# ── Previously: Bidirectional Mamba (commented out) ──────────────────────────
+# from mamba_ssm import Mamba
+#
+# class TemporalMambaBlock(nn.Module):
+#     def __init__(self, d_model, d_state=16, d_conv=4, expand=2, bidirectional=True):
+#         super().__init__()
+#         self.bidirectional = bidirectional
+#         self.norm = nn.LayerNorm(d_model)
+#         self.mamba_fwd = Mamba(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)
+#         if bidirectional:
+#             self.mamba_bwd = Mamba(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)
+#             self.merge = nn.Linear(2 * d_model, d_model, bias=False)
+#         self.ffn_norm = nn.LayerNorm(d_model)
+#         self.ffn = nn.Sequential(
+#             nn.Linear(d_model, 4 * d_model), nn.GELU(), nn.Linear(4 * d_model, d_model),
+#         )
+#     def forward(self, x):
+#         normed = self.norm(x)
+#         fwd = self.mamba_fwd(normed)
+#         if self.bidirectional:
+#             rev = torch.flip(self.mamba_bwd(torch.flip(normed, dims=[1])), dims=[1])
+#             ssm_out = self.merge(torch.cat([fwd, rev], dim=-1))
+#         else:
+#             ssm_out = fwd
+#         x = x + ssm_out
+#         x = x + self.ffn(self.ffn_norm(x))
+#         return x
+# ─────────────────────────────────────────────────────────────────────────────
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from mamba_ssm import Mamba
+from mamba_ssm import Mamba  # still needed for CrossClipMemory
 
 
-class TemporalMambaBlock(nn.Module):
+class CausalConvBlock(nn.Module):
     """
-    Bidirectional Mamba block: SSM (fwd+bwd) → merge → FFN, with residuals.
+    Causal Depthwise Conv block: DWConv → Pointwise → FFN, with residuals.
+
+    Causal padding: left-pad by (kernel_size - 1), trim right so each
+    output position t sees only frames [t-kernel_size+1 … t].
+    Identical in batch training and online (buffer-based) inference.
 
     Args:
-        d_model:       feature dimension (e.g. 768 for VMamba-Tiny)
-        d_state:       SSM state size
-        d_conv:        depthwise conv kernel size
-        expand:        expansion factor for inner dimension
-        bidirectional: if True, runs a second backward SSM and merges
+        d_model:     feature dimension (e.g. 768)
+        kernel_size: temporal receptive field in frames (default 15)
     """
 
-    def __init__(
-        self,
-        d_model: int,
-        d_state: int = 16,
-        d_conv: int = 4,
-        expand: int = 2,
-        bidirectional: bool = True,
-    ):
+    def __init__(self, d_model: int, kernel_size: int = 15):
         super().__init__()
-        self.bidirectional = bidirectional
+        self.kernel_size = kernel_size
 
         self.norm = nn.LayerNorm(d_model)
-        self.mamba_fwd = Mamba(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)
-        if bidirectional:
-            self.mamba_bwd = Mamba(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)
-            self.merge = nn.Linear(2 * d_model, d_model, bias=False)
+        # Depthwise conv: each channel filtered independently (cheap)
+        # padding=kernel_size-1 pads left; we trim the extra right positions
+        self.dw_conv = nn.Conv1d(
+            d_model, d_model, kernel_size,
+            padding=kernel_size - 1, groups=d_model,
+        )
+        # Pointwise: mix channels after spatial filtering
+        self.pw_conv = nn.Linear(d_model, d_model)
 
-        # FFN: pre-norm MLP with 4× expansion, following Mamba/Jamba convention
         self.ffn_norm = nn.LayerNorm(d_model)
         self.ffn = nn.Sequential(
             nn.Linear(d_model, 4 * d_model),
@@ -68,14 +93,17 @@ class TemporalMambaBlock(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: (B, T, d_model) → (B, T, d_model)"""
+        B, T, d = x.shape
+
+        # Depthwise causal conv
         normed = self.norm(x)
-        fwd = self.mamba_fwd(normed)
-        if self.bidirectional:
-            rev = torch.flip(self.mamba_bwd(torch.flip(normed, dims=[1])), dims=[1])
-            ssm_out = self.merge(torch.cat([fwd, rev], dim=-1))
-        else:
-            ssm_out = fwd
-        x = x + ssm_out
+        h = normed.transpose(1, 2)                   # (B, d, T)
+        h = self.dw_conv(h)[:, :, :T]               # causal: drop right-padded positions
+        h = h.transpose(1, 2)                        # (B, T, d)
+        h = self.pw_conv(h)
+        x = x + h
+
+        # FFN
         x = x + self.ffn(self.ffn_norm(x))
         return x
 
@@ -201,10 +229,10 @@ class LocalContextCompressor(nn.Module):
 
 class TemporalRefiner(nn.Module):
     """
-    Stack of N bidirectional Mamba blocks for temporal refinement of visual tokens.
+    Stack of N CausalConvBlocks for temporal refinement of visual tokens.
 
     Prepends a frame-delta injection step: the per-frame visual difference
-    x[t] - x[t-1] is projected and added to the input, giving each SSM block
+    x[t] - x[t-1] is projected and added to the input, giving each conv block
     an explicit motion signal that highlights phase-transition moments.
 
     Input:  (B, T, d_model)  — raw VMamba per-frame features
@@ -212,28 +240,26 @@ class TemporalRefiner(nn.Module):
 
     Args:
         d_model:       feature dimension
-        num_layers:    number of stacked blocks (1 or 2 recommended)
-        d_state:       SSM state size
-        d_conv:        depthwise conv kernel size
-        expand:        inner expansion factor
-        bidirectional: enable backward SSM in each block
+        num_layers:    number of stacked CausalConvBlocks
+        conv_kernel_size: temporal receptive field per block (frames)
+
+    # Previously accepted: d_state, d_conv, expand, bidirectional (Mamba params)
+    # These are no longer used and kept only as comments for reference.
+    # d_state=16, d_conv=4, expand=2, bidirectional=True
     """
 
     def __init__(
         self,
         d_model: int,
         num_layers: int = 2,
-        d_state: int = 16,
-        d_conv: int = 4,
-        expand: int = 2,
-        bidirectional: bool = True,
+        conv_kernel_size: int = 15,
     ):
         super().__init__()
         # Frame-delta: projects Δx[t] = x[t] - x[t-1] into the feature space
         self.delta_proj = nn.Linear(d_model, d_model, bias=False)
 
         self.layers = nn.ModuleList([
-            TemporalMambaBlock(d_model, d_state, d_conv, expand, bidirectional)
+            CausalConvBlock(d_model, kernel_size=conv_kernel_size)
             for _ in range(num_layers)
         ])
         self.final_norm = nn.LayerNorm(d_model)
