@@ -15,6 +15,7 @@ Video-by-video training loop:
 import os
 import sys
 import math
+import random
 import argparse
 from collections import defaultdict
 
@@ -280,6 +281,7 @@ def main():
         cfg = OmegaConf.merge(cfg, OmegaConf.from_dotlist(args.overrides))
 
     torch.manual_seed(cfg.train.seed)
+    random.seed(cfg.train.seed)
     device = torch.device(cfg.train.device if torch.cuda.is_available() else "cpu")
 
     # ── Model ─────────────────────────────────────────────────────────────────
@@ -320,7 +322,10 @@ def main():
         epoch_phase_correct = defaultdict(int)
         epoch_phase_total   = defaultdict(int)
 
-        for step, video_id in enumerate(cfg.data.train_videos, 1):
+        train_videos = list(cfg.data.train_videos)
+        random.shuffle(train_videos)
+
+        for step, video_id in enumerate(train_videos, 1):
             result = run_video(
                 model, video_id, cfg, device,
                 optimizer=optimizer, scheduler=scheduler, scaler=scaler, is_train=True,

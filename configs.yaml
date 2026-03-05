@@ -19,13 +19,13 @@ model:
   # ── Clip hint tokens ──────────────────────────────────────────────────────
   # Learnable queries cross-attend with VMamba features to produce
   # N_hints clip-level summary tokens, prepended before visual tokens.
-  n_hints: 8                       # number of ClipHint tokens per clip
+  n_hints: 12                       # number of ClipHint tokens per clip
 
   # ── Temporal context (Detached Context Prefix) ────────────────────────────
   # Number of previous-clip LLM hidden states to prepend as context.
   # These are detached (no gradient), giving cross-clip temporal continuity
   # without BPTT cost.
-  context_len: 30                  # K: frames carried over from previous clip
+  context_len: 48                  # K: frames carried over from previous clip
 
   # ── Freeze settings ───────────────────────────────────────────────────────
   freeze_llm: true                 # keep LLM weights frozen
@@ -76,11 +76,11 @@ model:
 
 
 data:
-  data_root: "/workspace/surg_video/cholec80_preprocessed"
+  data_root: "./cholec80_preprocessed"
   phase_annotation_dir: "phase_annotations_preprocessed"
   tool_annotation_dir: "tool_annotations_1fps"
   img_size: 224
-  seq_len: 128                     # T: number of frames (tokens) per clip
+  seq_len: 192                     # T: number of frames (tokens) per clip
   num_phases: 7
 
   # CholecT80 standard split
@@ -102,7 +102,7 @@ train:
   epochs: 100
   warmup_epochs: 5
 
-  use_amp: true            # mixed precision (fp16) — saves ~40% VRAM
+  use_amp: True            # mixed precision (fp16) — saves ~40% VRAM
 
   optimizer: "adamw"
   lr: 0.00005
@@ -110,7 +110,7 @@ train:
   grad_clip: 1.0
 
   # ── Loss weights ──────────────────────────────────────────────────────────
-  label_smoothing: 0.1   # CE label smoothing (0 = off)
+  label_smoothing: 0.0   # CE label smoothing (0 = off)
   w_smooth:        0.3   # temporal smoothness loss weight
   w_diversity:     0.1  # hint diversity loss weight
   w_attn_focus:    0.3   # hint attention focus loss weight

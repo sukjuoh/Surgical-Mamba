@@ -11,11 +11,16 @@ Why Mamba here:
   - A causal SSM refiner lets each frame's representation attend to ALL
     previous frames with O(T) complexity — ideal for surgical video where
     phase identity depends on what happened earlier in the clip.
-  - Non-causal (bidirectional) mode: we use bidirectional scan so each
-    token can see the full clip context before being sent to the LLM.
+  - Bidirectional mode: forward + backward Mamba so each token sees the
+    full clip context in both directions before being sent to the LLM.
 
-Note: Uses Mamba (v1) rather than Mamba2 because causal_conv1d (required
-by Mamba2's Triton kernel) is not installed in this environment.
+Enhancements over a plain Mamba stack:
+  1. True bidirectional scan — forward Mamba + backward Mamba (flipped),
+     merged by a linear projection. Each frame sees both past and future.
+  2. FFN after each SSM block — post-SSM MLP (pre-norm, GELU) improves
+     per-token feature expressiveness, following the Mamba-2 / Jamba recipe.
+  3. Frame-delta injection — x[t] - x[t-1] encodes local visual motion,
+     which is a strong signal for detecting surgical phase transitions.
 """
 
 import torch
@@ -25,43 +30,73 @@ from mamba_ssm import Mamba
 
 class TemporalMambaBlock(nn.Module):
     """
-    Single Mamba block with pre-LayerNorm and residual connection.
+    Bidirectional Mamba block: SSM (fwd+bwd) → merge → FFN, with residuals.
 
     Args:
-        d_model:   feature dimension (e.g. 768 for VMamba-Tiny)
-        d_state:   SSM state size
-        d_conv:    depthwise conv kernel size
-        expand:    expansion factor for inner dimension
+        d_model:       feature dimension (e.g. 768 for VMamba-Tiny)
+        d_state:       SSM state size
+        d_conv:        depthwise conv kernel size
+        expand:        expansion factor for inner dimension
+        bidirectional: if True, runs a second backward SSM and merges
     """
 
-    def __init__(self, d_model: int, d_state: int = 16, d_conv: int = 4, expand: int = 2):
+    def __init__(
+        self,
+        d_model: int,
+        d_state: int = 16,
+        d_conv: int = 4,
+        expand: int = 2,
+        bidirectional: bool = True,
+    ):
         super().__init__()
+        self.bidirectional = bidirectional
+
         self.norm = nn.LayerNorm(d_model)
-        self.mamba = Mamba(
-            d_model=d_model,
-            d_state=d_state,
-            d_conv=d_conv,
-            expand=expand,
+        self.mamba_fwd = Mamba(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)
+        if bidirectional:
+            self.mamba_bwd = Mamba(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)
+            self.merge = nn.Linear(2 * d_model, d_model, bias=False)
+
+        # FFN: pre-norm MLP with 4× expansion, following Mamba/Jamba convention
+        self.ffn_norm = nn.LayerNorm(d_model)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, 4 * d_model),
+            nn.GELU(),
+            nn.Linear(4 * d_model, d_model),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: (B, T, d_model) → (B, T, d_model)"""
-        return x + self.mamba(self.norm(x))
+        normed = self.norm(x)
+        fwd = self.mamba_fwd(normed)
+        if self.bidirectional:
+            rev = torch.flip(self.mamba_bwd(torch.flip(normed, dims=[1])), dims=[1])
+            ssm_out = self.merge(torch.cat([fwd, rev], dim=-1))
+        else:
+            ssm_out = fwd
+        x = x + ssm_out
+        x = x + self.ffn(self.ffn_norm(x))
+        return x
 
 
 class TemporalRefiner(nn.Module):
     """
-    Stack of N Mamba blocks for temporal refinement of visual tokens.
+    Stack of N bidirectional Mamba blocks for temporal refinement of visual tokens.
+
+    Prepends a frame-delta injection step: the per-frame visual difference
+    x[t] - x[t-1] is projected and added to the input, giving each SSM block
+    an explicit motion signal that highlights phase-transition moments.
 
     Input:  (B, T, d_model)  — raw VMamba per-frame features
     Output: (B, T, d_model)  — temporally-refined features
 
     Args:
-        d_model:    feature dimension
-        num_layers: number of stacked Mamba blocks (1 or 2 recommended)
-        d_state:    SSM state size
-        d_conv:     depthwise conv kernel size
-        expand:     inner expansion factor
+        d_model:       feature dimension
+        num_layers:    number of stacked blocks (1 or 2 recommended)
+        d_state:       SSM state size
+        d_conv:        depthwise conv kernel size
+        expand:        inner expansion factor
+        bidirectional: enable backward SSM in each block
     """
 
     def __init__(
@@ -71,16 +106,24 @@ class TemporalRefiner(nn.Module):
         d_state: int = 16,
         d_conv: int = 4,
         expand: int = 2,
+        bidirectional: bool = True,
     ):
         super().__init__()
+        # Frame-delta: projects Δx[t] = x[t] - x[t-1] into the feature space
+        self.delta_proj = nn.Linear(d_model, d_model, bias=False)
+
         self.layers = nn.ModuleList([
-            TemporalMambaBlock(d_model, d_state, d_conv, expand)
+            TemporalMambaBlock(d_model, d_state, d_conv, expand, bidirectional)
             for _ in range(num_layers)
         ])
         self.final_norm = nn.LayerNorm(d_model)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: (B, T, d_model) → (B, T, d_model)"""
+        # Frame-delta injection: Δx[0] = 0, Δx[t] = x[t] - x[t-1]
+        delta = torch.diff(x, dim=1, prepend=x[:, :1, :])
+        x = x + self.delta_proj(delta)
+
         for layer in self.layers:
             x = layer(x)
         return self.final_norm(x)
