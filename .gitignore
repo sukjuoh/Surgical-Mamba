@@ -1,0 +1,11 @@
+.pt
+.pth
+.ckpt
+wandb/
+cholec80_preprocessed/
+_pycache_/
+checkpoints/
+pretrained/pretrained/
+checkpoints/
+*.pth
+*.pt

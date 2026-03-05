@@ -1,0 +1,125 @@
+# ============================================================
+# Surgical Phase Recognition - Configuration
+# ============================================================
+
+model:
+  llm_model_name: "Qwen/Qwen2.5-0.5B"   # HuggingFace model ID (hidden_size=896)
+  num_phases: 7                           # CholecT80: 7 surgical phases
+  vmamba_pretrained: "./pretrained/vssmtiny.pth"  # VMamba-Tiny ImageNet pretrained
+
+  # ── Visual projector (Linear + ReprogrammingLayer) ───────────────────────
+  n_heads: 8                       # heads for reprogramming cross-attention
+  d_ff: 256                        # output bottleneck (first d_ff dims of LLM hidden states)
+  num_tokens: 1000                 # vocabulary reduction for reprogramming K/V (Qwen vocab=151936)
+
+  # ── Temporal Mamba refiner ────────────────────────────────────────────────
+  # Mamba2 1D temporal refinement applied to VMamba features before reprogramming.
+  mamba_layers: 1                  # number of stacked Mamba2 blocks (0 = disabled)
+
+  # ── Clip hint tokens ──────────────────────────────────────────────────────
+  # Learnable queries cross-attend with VMamba features to produce
+  # N_hints clip-level summary tokens, prepended before visual tokens.
+  n_hints: 8                       # number of ClipHint tokens per clip
+
+  # ── Temporal context (Detached Context Prefix) ────────────────────────────
+  # Number of previous-clip LLM hidden states to prepend as context.
+  # These are detached (no gradient), giving cross-clip temporal continuity
+  # without BPTT cost.
+  context_len: 30                  # K: frames carried over from previous clip
+
+  # ── Freeze settings ───────────────────────────────────────────────────────
+  freeze_llm: true                 # keep LLM weights frozen
+  freeze_vmamba: false             # fine-tune VMamba extractor
+
+  # ── Regularization ────────────────────────────────────────────────────────
+  attention_dropout: 0.1           # ReprogrammingLayer attention dropout
+  hint_dropout: 0.1                # ClipHintEncoder attention dropout
+  output_dropout: 0.1
+
+  # ── Prompt-as-Prefix ──────────────────────────────────────────────────────
+  # Static knowledge injected to the LLM before the visual tokens.
+  # Describes: (1) dataset context, (2) task definition, (3) phase semantics,
+  # (4) tool semantics, (5) input sequence structure including hint token slots.
+  prompt: >
+    <|start_prompt|>
+    Dataset description: Laparoscopic cholecystectomy surgical video recorded at 1 fps.
+    Task description: Recognize the surgical phase label for each video frame token
+    given the sequence of visual feature tokens.
+    The 7 surgical phases are:
+    Phase 0 - Preparation: initial setup and trocar insertion before the procedure begins.
+    Phase 1 - CalotTriangleDissection: dissection of peritoneum around the Calot triangle
+    to expose the cystic duct and artery.
+    Phase 2 - ClippingCutting: application of clips and cutting of the cystic duct
+    and cystic artery.
+    Phase 3 - GallbladderDissection: dissection of the gallbladder from the liver bed.
+    Phase 4 - GallbladderPackaging: placement of the gallbladder into a retrieval bag.
+    Phase 5 - CleaningCoagulation: irrigation, cleaning, and coagulation of the surgical site.
+    Phase 6 - GallbladderRetraction: retraction and extraction of the gallbladder.
+    The 7 surgical tools used in this procedure are:
+    Grasper: grasps and retracts tissue to expose the surgical field.
+    Bipolar: applies bipolar electrical current for hemostasis and coagulation.
+    Hook: dissects and coagulates tissue using a hook-shaped electrosurgical tip.
+    Scissors: cuts tissue and structures during dissection.
+    Clipper: applies metal clips to seal the cystic duct and cystic artery before cutting.
+    Irrigator: irrigates the surgical field with saline and aspirates fluid.
+    SpecimenBag: a retrieval bag used to contain the gallbladder for safe extraction.
+    Input sequence structure per clip:
+    [Hint tokens] 8 clip-level visual summary tokens follow immediately after this prompt.
+    Each hint token is a learned compression of the clip visual features, capturing
+    dominant scene content, temporal dynamics, and phase transition signals.
+    [Tool context] A text token sequence describing which surgical tools are visible
+    in the current clip follows the hint tokens.
+    [Visual tokens] Per-frame visual feature tokens follow the tool context.
+    Each visual token encodes one second of video as a 768-dimensional feature
+    vector extracted by a VMamba-Tiny backbone.
+    <|end_prompt|>
+
+
+data:
+  data_root: "/workspace/surg_video/cholec80_preprocessed"
+  phase_annotation_dir: "phase_annotations_preprocessed"
+  tool_annotation_dir: "tool_annotations_1fps"
+  img_size: 224
+  seq_len: 128                     # T: number of frames (tokens) per clip
+  num_phases: 7
+
+  # CholecT80 standard split
+  train_videos: [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,
+                 21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40]
+  val_videos:   [41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,
+                 61,62,63,64,65,66,67,68,69,70,71,72,73,74,75,76,77,78,79,80]
+ # val_videos:   [41,42,43,44,45,46,47,48]
+  test_videos:  [49,50,51,52,53,54,55,56,57,58,59,60,
+                 61,62,63,64,65,66,67,68,69,70,71,72,73,74,75,76,77,78,79,80]
+
+
+train:
+  seed: 42
+  device: "cuda"
+
+  num_workers: 0          # 0 = main process only (avoids shm issues in containers)
+
+  epochs: 100
+  warmup_epochs: 5
+
+  use_amp: true            # mixed precision (fp16) — saves ~40% VRAM
+
+  optimizer: "adamw"
+  lr: 0.00005
+  weight_decay: 0.1
+  grad_clip: 1.0
+
+  # ── Loss weights ──────────────────────────────────────────────────────────
+  label_smoothing: 0.1   # CE label smoothing (0 = off)
+  w_smooth:        0.3   # temporal smoothness loss weight
+  w_diversity:     0.1  # hint diversity loss weight
+  w_attn_focus:    0.3   # hint attention focus loss weight
+
+  # Learning rate scheduler
+  scheduler: "cosine"              # "cosine" | "step" | null
+  lr_min: 1.0e-6                   # cosine annealing min lr
+
+  # Logging & checkpointing
+  save_dir: "./checkpoints"
+  log_interval: 10                 # steps
+  eval_interval: 1                 # epochs
