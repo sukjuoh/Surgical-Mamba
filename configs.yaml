@@ -77,9 +77,9 @@ model:
 data:
   data_root: "./cholec80_preprocessed"
   phase_annotation_dir: "phase_annotations_preprocessed"
-  tool_annotation_dir: "tool_annotations_1fps"
+  tool_annotation_dir: "tool_annotations_preprocessed"
   img_size: 224
-  seq_len: 256                     # T: number of frames (tokens) per clip
+  seq_len: 192                     # T: number of frames (tokens) per clip
   num_phases: 7
 
   # CholecT80 standard split
