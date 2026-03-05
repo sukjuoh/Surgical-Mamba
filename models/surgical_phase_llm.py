@@ -12,7 +12,7 @@ Architecture (per clip):
   refined_feats (B, T, 768)   — temporally-aware frame features
        │
        ├──────────────────────────────────────┐
-       │  VisualProjector                     │ ClipHintEncoder (improved)
+       │  VisualProjector                     │ ClipHintEncoder
        │  ┌──────────────────────────────┐    │  temporal-segment biased queries
        │  │ direct = Linear(768→d_llm)   │    │  + transition stream (frame diffs)
        │  │ reprogram = Reprogram(...)   │    │  + slot embeddings + self-attn + FFN
@@ -23,13 +23,12 @@ Architecture (per clip):
        │             │ visual_tokens           │ hint_tokens (B, N_hints, d_llm)
        └─────────────┼────────────────────────┘
                      │
-                     ▼
-  tool_text_emb (B, L_tool, d_llm)
-    – per-segment tool text: "frames 0-31: Grasper, Hook; frames 32-63: Hook"
-    – tokenized + embedded with frozen LLM embedding layer
+  Cross-clip context (from previous clip, both detached):
+    prev_memory  (B, N_hints, d_llm)  — Mamba SSM global summary of all past clips
+    prev_visual  (B, T, d_llm)        → LocalContextCompressor → (B, T//4, d_llm)
                      │
                      ▼
-  LLM input: [attended_memory(N_hints) | tool_text_emb | hint_tokens | visual_tokens]
+  LLM input: [prev_memory(N_hints) | compressed_prev(T//4) | tool_text | hint_tokens | visual_tokens]
   with past_key_values = prompt_kv (fixed, computed once per video)
                      │
                      ▼ Frozen LLM
@@ -40,7 +39,8 @@ Architecture (per clip):
                      ▼ output_head
   logits (B, T, num_phases)
 
-  + memory_new = CrossClipMemory(hints, memory_prev)  → passed to next clip (detached)
+  + new_memory = CrossClipMemory(hints, prev_memory)  → passed to next clip (detached)
+  + visual_tokens (detached)                          → passed to next clip as prev_visual
 """
 
 import torch
@@ -51,7 +51,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 from .vmamba_extractor import VMambaTinyExtractor
 from .reprogramming import ReprogrammingLayer
 from .clip_hint import ClipHintEncoder
-from .temporal_mamba import TemporalRefiner, CrossClipMemory, MemoryFusion
+from .temporal_mamba import TemporalRefiner, CrossClipMemory, LocalContextCompressor
 
 
 CHOLEC80_PHASES = [
@@ -79,7 +79,8 @@ _DEFAULT_PROMPT = (
     "Dataset description: Laparoscopic cholecystectomy surgical video recorded at 1 fps. "
     "Task description: Recognize the surgical phase label for each video frame token "
     "given the sequence of visual feature tokens. "
-    "The 7 surgical phases are: "
+    "The 7 surgical phases always progress in strict sequential order "
+    "(0 -> 1 -> 2 -> 3 -> 4 -> 5 -> 6) and never repeat or skip within a procedure. "
     "Phase 0 - Preparation: initial setup and trocar insertion before the procedure begins. "
     "Phase 1 - CalotTriangleDissection: dissection of peritoneum around the Calot triangle "
     "to expose the cystic duct and artery. "
@@ -96,12 +97,22 @@ _DEFAULT_PROMPT = (
     "Clipper: applies metal clips to seal the cystic duct and cystic artery before cutting. "
     "Irrigator: irrigates the surgical field with saline and aspirates fluid. "
     "SpecimenBag: a retrieval bag used to contain the gallbladder for safe extraction. "
+    "Typical tool usage per phase: "
+    "Phase 0 - Preparation: no tools or Grasper only. "
+    "Phase 1 - CalotTriangleDissection: Grasper, Hook, Bipolar. "
+    "Phase 2 - ClippingCutting: Grasper, Clipper, Scissors. "
+    "Phase 3 - GallbladderDissection: Grasper, Hook, Bipolar. "
+    "Phase 4 - GallbladderPackaging: Grasper, SpecimenBag. "
+    "Phase 5 - CleaningCoagulation: Grasper, Bipolar, Irrigator. "
+    "Phase 6 - GallbladderRetraction: Grasper, SpecimenBag. "
     "Input sequence structure per clip: "
-    "[Hint tokens] 8 clip-level visual summary tokens follow immediately after this prompt. "
-    "Each hint token captures a different temporal segment of the clip and specialises in "
-    "either dominant scene content or phase transition signals. "
+    "[Global memory tokens] A fixed number of tokens summarising all previously seen clips "
+    "via a Mamba SSM, providing long-range surgical context across the entire video. "
+    "[Local hint tokens] Clip-level visual summary tokens follow the global memory. "
+    "Each local hint token is a learned compression of the current clip visual features, "
+    "capturing dominant scene content, temporal dynamics, and phase transition signals. "
     "[Tool context] A text description of which surgical tools are active in each temporal "
-    "segment of the current clip follows the hint tokens. "
+    "segment of the current clip follows the local hint tokens. "
     "[Visual tokens] Per-frame visual feature tokens follow the tool context. "
     "Each visual token encodes one second of video as a 768-dimensional feature "
     "vector extracted by a VMamba-Tiny backbone and refined by a Mamba temporal encoder. "
@@ -153,6 +164,7 @@ class SurgicalPhaseLLM(nn.Module):
         d_ff: int = 256,
         num_tokens: int = 1000,
         n_hints: int = 8,
+        local_context_ratio: int = 4,
         prompt: str = _DEFAULT_PROMPT,
         attention_dropout: float = 0.1,
         hint_dropout: float = 0.1,
@@ -239,13 +251,14 @@ class SurgicalPhaseLLM(nn.Module):
         self.prompt_len = prompt_emb.shape[1]
         self._prompt_kv: tuple = None
 
-        # ── 7. Cross-clip memory (SSM-based) ─────────────────────────────────
-        # Each clip: memory = CrossClipMemory(hints, prev_memory)
-        # memory is NOT prepended to LLM input directly — instead it is fused
-        # into visual_tokens via MemoryFusion (cross-attention), keeping LLM
-        # sequence length fixed.
+        # ── 7. Cross-clip memory (SSM-based) + local context compressor ──────
+        # Global: CrossClipMemory integrates current hints with all past clips.
+        #   prev_memory is prepended directly to LLM input as global hint tokens
+        #   (no cross-attention — preserves the pure global summary signal).
+        # Local: LocalContextCompressor reduces the previous clip's visual tokens
+        #   to T//4 tokens via a linear layer, prepended after the global tokens.
         self.cross_clip_memory = CrossClipMemory(d_model=self.d_llm)
-        self.memory_fusion = MemoryFusion(d_model=self.d_llm, n_heads=n_heads)
+        self.local_compressor = LocalContextCompressor(ratio=local_context_ratio)
 
         # ── 8. Output head ───────────────────────────────────────────────────
         self.output_dropout = nn.Dropout(output_dropout)
@@ -328,6 +341,7 @@ class SurgicalPhaseLLM(nn.Module):
         frames: torch.Tensor,
         tool_annots: torch.Tensor = None,
         memory: torch.Tensor = None,
+        prev_visual: torch.Tensor = None,
         prompt_kv: tuple = None,
     ):
         """
@@ -337,12 +351,15 @@ class SurgicalPhaseLLM(nn.Module):
             frames:      (B, T, 3, H, W)
             tool_annots: (B, T, 7) binary/float tool presence, optional
             memory:      (B, N_hints, d_llm) detached CrossClipMemory output from
-                         previous clip; prepended to LLM input as temporal context
+                         previous clip; prepended directly as global hint tokens
+            prev_visual: (B, T, d_llm) detached visual_tokens from previous clip;
+                         compressed to T//4 and prepended as local context
             prompt_kv:   cached KV from build_prompt_kv(); uses self._prompt_kv if None
 
         Returns:
             logits:          (B, T, num_phases)
             new_memory:      (B, N_hints, d_llm) detached – pass as memory for next clip
+            new_prev_visual: (B, T, d_llm) detached  – pass as prev_visual for next clip
             hints:           (B, N_hints, d_llm) – for hint diversity loss
             attn_focus_loss: scalar – attention focus loss from hint encoder
         """
@@ -377,17 +394,19 @@ class SurgicalPhaseLLM(nn.Module):
         # new_memory will be passed to the NEXT clip (detached).
         new_memory = self.cross_clip_memory(hints, memory)              # (B, N_hints, d_llm)
 
-        # 4c. Memory-attended context ─────────────────────────────────────────
-        # Q=memory(past), K/V=visual_tokens(current) → (B, N_hints, d_llm)
-        # Past memory queries the current visual to surface history-relevant info.
-        # Prepended to LLM input as a dedicated prefix, visual_tokens stay intact.
-        attended_memory = self.memory_fusion(memory, visual_tokens) if memory is not None else None
-
         # 5. Build LLM input sequence ─────────────────────────────────────────
-        # [attended_memory(N_hints) | tool_text_emb | hint_tokens | visual_tokens]
+        # [prev_memory(global, N_hints) | compressed_prev(local, T//4) |
+        #  tool_text | hint_tokens | visual_tokens]
+        #
+        # prev_memory: Mamba SSM global summary of all past clips — prepended
+        #   directly without cross-attention to preserve the pure global signal.
+        # compressed_prev: previous clip's visual tokens downsampled to T//4
+        #   via a linear layer — provides dense local context from the last clip.
         parts = []
-        if attended_memory is not None:
-            parts.append(attended_memory)
+        if memory is not None:
+            parts.append(memory)                                        # global context
+        if prev_visual is not None:
+            parts.append(self.local_compressor(prev_visual))           # local context
         if tool_annots is not None:
             parts.append(self._make_tool_emb(tool_annots))
         parts.append(hints)
@@ -416,7 +435,7 @@ class SurgicalPhaseLLM(nn.Module):
         frame_hidden = hidden[:, -T:, :self.d_ff].float()             # (B, T, d_ff)
         logits = self.output_head(self.output_dropout(frame_hidden))  # (B, T, num_phases)
 
-        return logits, new_memory.detach(), hints, attn_focus_loss
+        return logits, new_memory.detach(), visual_tokens.detach(), hints, attn_focus_loss
 
     # ── Convenience ──────────────────────────────────────────────────────────
 
@@ -424,7 +443,7 @@ class SurgicalPhaseLLM(nn.Module):
         """Single-clip forward without temporal context (for quick testing)."""
         if self._prompt_kv is None:
             self.build_prompt_kv()
-        logits, _, _, _ = self.forward_clip(frames, tool_annots=tool_annots)
+        logits, _, _, _, _ = self.forward_clip(frames, tool_annots=tool_annots)
         return logits
 
     # ── Config factory ───────────────────────────────────────────────────────
@@ -444,6 +463,7 @@ class SurgicalPhaseLLM(nn.Module):
             d_ff             = m.d_ff,
             num_tokens       = m.num_tokens,
             n_hints          = m.n_hints,
+            local_context_ratio = m.local_context_ratio,
             prompt           = m.prompt,
             attention_dropout= m.attention_dropout,
             hint_dropout     = m.hint_dropout,

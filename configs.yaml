@@ -26,6 +26,11 @@ model:
   # an updated memory (B, N_hints, d_llm), prepended to the next clip's LLM
   # input. Replaces raw hidden-state truncation; memory size = n_hints tokens.
 
+  # ── Local context compressor ──────────────────────────────────────────────
+  # Previous clip's visual_tokens averaged every 'ratio' frames → T//ratio
+  # tokens prepended to LLM input as dense local context.
+  local_context_ratio: 4            # temporal downsampling factor (4 → T//4 tokens)
+
   # ── Freeze settings ───────────────────────────────────────────────────────
   freeze_llm: true                 # keep LLM weights frozen
   freeze_vmamba: false             # fine-tune VMamba extractor
@@ -44,7 +49,8 @@ model:
     Dataset description: Laparoscopic cholecystectomy surgical video recorded at 1 fps.
     Task description: Recognize the surgical phase label for each video frame token
     given the sequence of visual feature tokens.
-    The 7 surgical phases are:
+    The 7 surgical phases always progress in strict sequential order
+    (0 -> 1 -> 2 -> 3 -> 4 -> 5 -> 6) and never repeat or skip within a procedure.
     Phase 0 - Preparation: initial setup and trocar insertion before the procedure begins.
     Phase 1 - CalotTriangleDissection: dissection of peritoneum around the Calot triangle
     to expose the cystic duct and artery.
@@ -62,12 +68,22 @@ model:
     Clipper: applies metal clips to seal the cystic duct and cystic artery before cutting.
     Irrigator: irrigates the surgical field with saline and aspirates fluid.
     SpecimenBag: a retrieval bag used to contain the gallbladder for safe extraction.
+    Typical tool usage per phase:
+    Phase 0 - Preparation: no tools or Grasper only.
+    Phase 1 - CalotTriangleDissection: Grasper, Hook, Bipolar.
+    Phase 2 - ClippingCutting: Grasper, Clipper, Scissors.
+    Phase 3 - GallbladderDissection: Grasper, Hook, Bipolar.
+    Phase 4 - GallbladderPackaging: Grasper, SpecimenBag.
+    Phase 5 - CleaningCoagulation: Grasper, Bipolar, Irrigator.
+    Phase 6 - GallbladderRetraction: Grasper, SpecimenBag.
     Input sequence structure per clip:
-    [Hint tokens] 8 clip-level visual summary tokens follow immediately after this prompt.
-    Each hint token is a learned compression of the clip visual features, capturing
-    dominant scene content, temporal dynamics, and phase transition signals.
+    [Global memory tokens] A fixed number of tokens summarising all previously seen clips
+    via a Mamba SSM, providing long-range surgical context across the entire video.
+    [Local hint tokens] Clip-level visual summary tokens follow the global memory.
+    Each local hint token is a learned compression of the current clip visual features,
+    capturing dominant scene content, temporal dynamics, and phase transition signals.
     [Tool context] A text token sequence describing which surgical tools are visible
-    in the current clip follows the hint tokens.
+    in the current clip follows the local hint tokens.
     [Visual tokens] Per-frame visual feature tokens follow the tool context.
     Each visual token encodes one second of video as a 768-dimensional feature
     vector extracted by a VMamba-Tiny backbone.
@@ -110,8 +126,9 @@ train:
 
   # ── Loss weights ──────────────────────────────────────────────────────────
   label_smoothing: 0.0   # CE label smoothing (0 = off)
-  w_smooth:        0.3   # temporal smoothness loss weight
-  w_diversity:     0.1  # hint diversity loss weight
+  w_transition:    2.0   # CE weight multiplier for phase-transition frames (1 = off)
+  w_smooth:        0.3   # temporal smoothness loss weight (same-phase pairs only)
+  w_diversity:     0.1   # hint diversity loss weight
   w_attn_focus:    0.3   # hint attention focus loss weight
 
   # Learning rate scheduler

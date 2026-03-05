@@ -25,6 +25,7 @@ Enhancements over a plain Mamba stack:
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from mamba_ssm import Mamba
 
 
@@ -171,6 +172,31 @@ class MemoryFusion(nn.Module):
         kv = self.kv_norm(visual_tokens)
         attn_out, _ = self.cross_attn(q, kv, kv)
         return self.out_norm(memory + attn_out)
+
+
+class LocalContextCompressor(nn.Module):
+    """
+    Compresses the previous clip's visual tokens to 1/ratio of their temporal length
+    via average pooling. No learnable parameters — visual_tokens are already
+    well-refined (VMamba + TemporalRefiner + Reprogramming), so averaging suffices.
+
+    (B, T, d_model) → (B, T//ratio, d_model)
+
+    Args:
+        ratio:  temporal downsampling factor (default 4 → T//4 output tokens)
+    """
+
+    def __init__(self, ratio: int = 4):
+        super().__init__()
+        self.ratio = ratio
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x: (B, T, d_model) → (B, T//ratio, d_model)"""
+        B, T, d = x.shape
+        pad = (self.ratio - T % self.ratio) % self.ratio
+        if pad > 0:
+            x = F.pad(x, (0, 0, 0, pad))
+        return x.reshape(B, x.shape[1] // self.ratio, self.ratio, d).mean(dim=2)
 
 
 class TemporalRefiner(nn.Module):

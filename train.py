@@ -40,18 +40,24 @@ def masked_ce_loss(
     labels: torch.Tensor,
     mask: torch.Tensor,
     label_smoothing: float = 0.1,
+    w_transition: float = 1.0,
 ) -> torch.Tensor:
     """
-    Cross-entropy loss with label smoothing over valid (non-padded) positions.
+    Cross-entropy loss with label smoothing and optional transition weighting.
 
     Label smoothing (α=0.1): softens hard targets to (1-α)*one_hot + α/C.
-    Reduces overconfidence and improves calibration.
+
+    Transition weighting (w_transition > 1): frames where the phase label
+    changes from the previous or next frame are upweighted by w_transition.
+    Phase transitions are rare events (~handful per video) and easy to miss
+    with uniform CE; upweighting forces the model to pay attention to them.
 
     Args:
         logits:          (B, T, num_phases)
         labels:          (B, T)  int64
         mask:            (B, T)  bool, True = valid
         label_smoothing: smoothing factor (0 = standard CE)
+        w_transition:    weight multiplier for phase-transition frames (1 = off)
     """
     B, T, C = logits.shape
     logits_flat = logits.view(B * T, C)
@@ -63,30 +69,57 @@ def masked_ce_loss(
         label_smoothing=label_smoothing,
         reduction="none",
     )
+
+    if w_transition > 1.0:
+        # Frame t is a transition frame if its label differs from t-1 or t+1
+        prev_change = torch.cat([
+            labels.new_zeros(B, 1, dtype=torch.bool),
+            labels[:, 1:] != labels[:, :-1],
+        ], dim=1)                                           # (B, T)
+        next_change = torch.cat([
+            labels[:, :-1] != labels[:, 1:],
+            labels.new_zeros(B, 1, dtype=torch.bool),
+        ], dim=1)                                           # (B, T)
+        transition = (prev_change | next_change).float()   # (B, T)  1 at boundaries
+        weights = (1.0 + (w_transition - 1.0) * transition).view(B * T)
+        loss = loss * weights
+
     return loss[mask_flat].mean()
 
 
-def temporal_smoothness_loss(logits: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+def temporal_smoothness_loss(
+    logits: torch.Tensor,
+    mask: torch.Tensor,
+    labels: torch.Tensor = None,
+) -> torch.Tensor:
     """
-    Penalise abrupt changes in predicted phase distribution between adjacent frames.
+    Penalise abrupt changes in predicted phase distribution between adjacent frames,
+    applied only within same-phase pairs.
 
     Uses KL divergence between consecutive softmax outputs:
-        L_smooth = mean KL(p_t || p_{t+1})  over valid adjacent pairs
+        L_smooth = mean KL(p_t || p_{t+1})  over valid same-phase adjacent pairs
 
-    Surgical phases last minutes — adjacent frames should have nearly identical
-    distributions unless a genuine phase transition is occurring.
+    Restricting to same-phase pairs avoids fighting against legitimate transitions:
+    without this, the loss would penalise the model for correctly predicting a
+    sharp boundary, directly opposing transition-weighted CE.
 
     Args:
         logits: (B, T, num_phases)
         mask:   (B, T) bool, True = valid
+        labels: (B, T) int64, phase labels — if provided, only same-phase pairs used
     Returns:
         scalar loss
     """
-    probs = torch.softmax(logits, dim=-1)               # (B, T, C)
+    probs     = torch.softmax(logits, dim=-1)           # (B, T, C)
     log_probs = torch.log_softmax(logits, dim=-1)       # (B, T, C)
 
     # Adjacent-pair mask: both t and t+1 must be valid
     pair_mask = mask[:, :-1] & mask[:, 1:]              # (B, T-1)
+
+    # Restrict to same-phase pairs so we never penalise true transitions
+    if labels is not None:
+        same_phase = (labels[:, :-1] == labels[:, 1:])  # (B, T-1)
+        pair_mask  = pair_mask & same_phase
 
     # KL(p_t || p_{t+1}) = sum p_t * (log p_t - log p_{t+1})
     kl = (probs[:, :-1] * (log_probs[:, :-1] - log_probs[:, 1:])).sum(-1)  # (B, T-1)
@@ -196,8 +229,9 @@ def run_video(
     phase_total   = defaultdict(int)
 
     # Build prompt KV once per video (fixed prompt, reused across all clips)
-    prompt_kv = model.build_prompt_kv()
-    memory    = None  # CrossClipMemory state, reset per video
+    prompt_kv   = model.build_prompt_kv()
+    memory      = None  # CrossClipMemory global state, reset per video
+    prev_visual = None  # Previous clip's visual_tokens, reset per video
 
     for frames, tools, labels, valid_mask in loader:
         # frames:     (1, T, 3, H, W)
@@ -214,15 +248,17 @@ def run_video(
 
         with torch.set_grad_enabled(is_train):
             with autocast("cuda", enabled=(scaler is not None)):
-                logits, memory, hints, attn_loss = model.forward_clip(
-                    frames     = frames,
-                    tool_annots= tools,
-                    memory     = memory,
-                    prompt_kv  = prompt_kv,
+                logits, memory, prev_visual, hints, attn_loss = model.forward_clip(
+                    frames      = frames,
+                    tool_annots = tools,
+                    memory      = memory,
+                    prev_visual = prev_visual,
+                    prompt_kv   = prompt_kv,
                 )
                 loss_ce     = masked_ce_loss(logits, labels, valid_mask,
-                                             label_smoothing=cfg.train.label_smoothing)
-                loss_smooth = temporal_smoothness_loss(logits, valid_mask)
+                                             label_smoothing=cfg.train.label_smoothing,
+                                             w_transition=cfg.train.w_transition)
+                loss_smooth = temporal_smoothness_loss(logits, valid_mask, labels=labels)
                 loss_div    = hint_diversity_loss(hints)
                 loss = (loss_ce
                         + cfg.train.w_smooth     * loss_smooth
