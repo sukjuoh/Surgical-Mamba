@@ -114,21 +114,20 @@ train:
   num_workers: 0          # 0 = main process only (avoids shm issues in containers)
 
   epochs: 100
-  warmup_epochs: 5
+  warmup_epochs: 20
 
   use_amp: True            # mixed precision (fp16) — saves ~40% VRAM
 
   optimizer: "adamw"
   lr: 0.00005
-  weight_decay: 0.1
+  weight_decay: 0.01
   grad_clip: 1.0
 
   # ── Loss weights ──────────────────────────────────────────────────────────
-  label_smoothing: 0.0   # CE label smoothing (0 = off)
+  label_smoothing: 0.1   # CE label smoothing (0.1 = soft targets)
   w_smooth:        0.1   # temporal smoothness loss weight (all adjacent pairs)
   w_diversity:     0.1   # hint diversity loss weight
   w_attn_focus:    1.0   # hint attention focus loss weight
-  w_next_frame:    0.5   # auxiliary next-frame phase prediction loss weight
 
   # Learning rate scheduler
   scheduler: "cosine"              # "cosine" | "step" | null

@@ -151,34 +151,57 @@ class CrossClipMemory(nn.Module):
         self.mamba      = Mamba(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)
         self.out_norm   = nn.LayerNorm(d_model)
 
-    def forward(self, hints: torch.Tensor, prev_memory: torch.Tensor = None) -> torch.Tensor:
+    def forward(
+        self,
+        visual_tokens: torch.Tensor,
+        hints: torch.Tensor,
+        prev_memory: torch.Tensor = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """
-        hints:       (B, N_hints, d_model) — current clip's hint tokens
-        prev_memory: (B, N_hints, d_model) or None — previous clip's memory (detached)
+        visual_tokens: (B, T,       d_model) — per-frame projected features (d_llm)
+        hints:         (B, N_hints, d_model) — current clip's hint tokens
+        prev_memory:   (B, N_hints, d_model) or None — previous clip's memory (detached)
+
+        Two separate paths:
+
+        Read path — memory refreshed by current clip (for LLM context):
+            prev_memory(Q) × visual_tokens(K/V) → enriched_memory (B, N_hints, d)
+            Each memory slot attends to the current clip and updates itself with
+            what it finds relevant. enriched_memory replaces raw prev_memory as
+            the LLM's global prefix — the LLM sees a memory tuned to the current
+            clip, while visual_tokens remain a clean present-only representation.
+            Role separation: memory = past context, visual = current clip.
+
+        Write path — clean per-clip summary (for next clip):
+            Mamba([prev_memory | raw hints])[-N:] → new_memory.
+            Raw hints keep the write path independent of the read path.
 
         Returns:
-            memory: (B, N_hints, d_model) — updated memory for next clip
+            new_memory:      (B, N_hints, d_model) — stored for next clip (write path)
+            enriched_memory: (B, N_hints, d_model) or None — LLM global prefix (read path)
         """
         if prev_memory is not None:
-            # 1. Selective retrieval: hints query into prev_memory
-            retrieved, _ = self.cross_attn(
-                self.q_norm(hints),
-                self.kv_norm(prev_memory),
-                self.kv_norm(prev_memory),
+            # Read: each memory slot queries current clip → refreshes itself
+            enriched_memory, _ = self.cross_attn(
+                self.q_norm(prev_memory),
+                self.kv_norm(visual_tokens),
+                self.kv_norm(visual_tokens),
             )
-            enhanced = self.attn_norm(hints + retrieved)  # (B, N, d)
+            enriched_memory = self.attn_norm(prev_memory + enriched_memory)  # (B, N, d)
 
-            # 2. Mamba update: full history context
-            x = torch.cat([prev_memory, enhanced], dim=1)  # (B, 2*N, d)
+            # Write: Mamba over [prev_memory | raw hints]
+            x = torch.cat([prev_memory, hints], dim=1)                       # (B, 2N, d)
         else:
-            x = hints  # first clip: no memory to retrieve from
+            x = hints
+            enriched_memory = None
 
-        # 3. Residual SSM
+        # Residual SSM
         x = x + self.mamba(self.mamba_norm(x))
 
-        # 4. Take the last N_hints positions as the new memory
+        # Last N positions = new memory (for next clip)
         N = hints.shape[1]
-        return self.out_norm(x[:, -N:, :])
+        new_memory = self.out_norm(x[:, -N:, :])
+        return new_memory, enriched_memory
 
 
 

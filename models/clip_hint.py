@@ -62,7 +62,9 @@ class ClipHintEncoder(nn.Module):
         self.d_llm = d_llm
 
         # ── Temporal PE on visual K/V ────────────────────────────────────────
-        self.temporal_pe = nn.Parameter(torch.randn(1, max_seq, d_visual) * 0.02)
+        # Scale matches standard embedding init: std ≈ 1/√d so PE magnitude
+        # is comparable to feature vectors (which are also O(1/√d) after LN).
+        self.temporal_pe = nn.Parameter(torch.randn(1, max_seq, d_visual) * (d_visual ** -0.5))
 
         # ── Main cross-attention stream ──────────────────────────────────────
         self.hint_queries = nn.Parameter(torch.randn(1, n_hints, d_llm) * 0.02)

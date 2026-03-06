@@ -63,60 +63,26 @@ def masked_ce_loss(
     return loss[mask_flat].mean()
 
 
-def next_frame_ce_loss(
-    logits: torch.Tensor,
-    labels: torch.Tensor,
-    mask: torch.Tensor,
-    label_smoothing: float = 0.0,
-) -> torch.Tensor:
-    """
-    Auxiliary next-frame phase prediction loss.
-
-    At position t, use logits[t] to predict label[t+1].
-    Forces the model to anticipate upcoming phases — directly learns phase
-    transition signals without any heuristic weighting.
-
-    Only valid where both frame t and t+1 have valid labels.
-
-    Args:
-        logits:          (B, T, num_phases)
-        labels:          (B, T)  int64
-        mask:            (B, T)  bool, True = valid
-        label_smoothing: smoothing factor
-    """
-    B, T, C = logits.shape
-
-    # logits at t predicting labels at t+1
-    logits_shifted = logits[:, :-1].reshape(-1, C)   # (B*(T-1), C)
-    labels_shifted = labels[:, 1:].reshape(-1)        # (B*(T-1),)
-    pair_mask      = (mask[:, :-1] & mask[:, 1:]).reshape(-1)  # (B*(T-1),)
-
-    if pair_mask.sum() == 0:
-        return logits.new_tensor(0.0)
-
-    loss = nn.functional.cross_entropy(
-        logits_shifted, labels_shifted,
-        label_smoothing=label_smoothing,
-        reduction="none",
-    )
-    return loss[pair_mask].mean()
-
 
 def temporal_smoothness_loss(
     logits: torch.Tensor,
     mask: torch.Tensor,
 ) -> torch.Tensor:
     """
-    Penalise abrupt changes in predicted phase distribution between all adjacent frames.
+    Transition-aware temporal smoothness loss.
 
-    Uses KL divergence between consecutive softmax outputs:
-        L_smooth = mean KL(p_t || p_{t+1})  over all valid adjacent pairs
+    Penalises abrupt distribution changes between adjacent frames, but
+    automatically down-weights pairs near phase transitions: frames where
+    the model is uncertain (high entropy) are likely transition frames, and
+    forcing smoothness there would suppress legitimate sharp changes.
 
-    Applied to ALL pairs (including phase-transition boundaries), so it:
-      - suppresses oscillation within a phase (consistency)
-      - encourages gradual distribution shift at transitions rather than sudden jumps
-    Works in tandem with next_frame_ce_loss: next_frame_ce teaches WHEN to transition,
-    smooth loss ensures the transition happens GRADUALLY.
+    Weight per adjacent pair (t, t+1):
+        confidence_t  = 1 - H(p_t)  / H_max      ∈ [0, 1]
+        pair_weight   = confidence_t * confidence_{t+1}
+        L_smooth = mean( pair_weight * KL(p_t || p_{t+1}) )
+
+    At a confident within-phase pair:  pair_weight ≈ 1 → full smoothness.
+    At a transition boundary:          pair_weight ≈ 0 → loss suppressed.
 
     Args:
         logits: (B, T, num_phases)
@@ -135,7 +101,15 @@ def temporal_smoothness_loss(
 
     if pair_mask.sum() == 0:
         return logits.new_tensor(0.0)
-    return kl[pair_mask].mean()
+
+    # Entropy-based confidence weight: suppress loss at high-entropy (transition) frames
+    C = logits.shape[-1]
+    entropy = -(probs * torch.log(probs + 1e-8)).sum(-1)    # (B, T)
+    confidence = 1.0 - entropy / math.log(C)                # (B, T) ∈ [0, 1]
+    pair_conf = confidence[:, :-1] * confidence[:, 1:]      # (B, T-1)
+
+    weighted_kl = pair_conf * kl                             # (B, T-1)
+    return weighted_kl[pair_mask].mean()
 
 
 def hint_diversity_loss(hints: torch.Tensor) -> torch.Tensor:
@@ -224,7 +198,7 @@ def run_video_inference(
         labels     = labels.to(device)
         valid_mask = valid_mask.to(device)
 
-        logits, memory, prev_visual, _, _, _ = model.forward_clip(
+        logits, memory, prev_visual, _, _ = model.forward_clip(
             frames      = frames,
             tool_annots = tools,
             memory      = memory,
@@ -447,12 +421,11 @@ def run_video(
     )
 
     num_phases = cfg.data.num_phases
-    total_loss       = 0.0
-    total_loss_ce    = 0.0
-    total_loss_smooth= 0.0
-    total_loss_div   = 0.0
-    total_loss_attn  = 0.0
-    total_loss_next  = 0.0
+    total_loss        = 0.0
+    total_loss_ce     = 0.0
+    total_loss_smooth = 0.0
+    total_loss_div    = 0.0
+    total_loss_attn   = 0.0
     total_correct = 0
     total_frames  = 0
     phase_correct = defaultdict(int)
@@ -478,7 +451,7 @@ def run_video(
 
         with torch.set_grad_enabled(is_train):
             with autocast("cuda", enabled=(scaler is not None)):
-                logits, memory, prev_visual, hints, attn_loss, nf_logits = model.forward_clip(
+                logits, memory, prev_visual, hints, attn_loss = model.forward_clip(
                     frames      = frames,
                     tool_annots = tools,
                     memory      = memory,
@@ -489,15 +462,10 @@ def run_video(
                                              label_smoothing=cfg.train.label_smoothing)
                 loss_smooth = temporal_smoothness_loss(logits, valid_mask)
                 loss_div    = hint_diversity_loss(hints)
-                # Auxiliary next-frame prediction via adaptation head:
-                # at position t, nf_logits[t] predicts label[t+1].
-                loss_next   = next_frame_ce_loss(nf_logits, labels, valid_mask,
-                                                 label_smoothing=cfg.train.label_smoothing)
                 loss = (loss_ce
-                        + cfg.train.w_smooth      * loss_smooth
-                        + cfg.train.w_diversity   * loss_div
-                        + cfg.train.w_attn_focus  * attn_loss
-                        + cfg.train.w_next_frame  * loss_next)
+                        + cfg.train.w_smooth     * loss_smooth
+                        + cfg.train.w_diversity  * loss_div
+                        + cfg.train.w_attn_focus * attn_loss)
 
         if is_train:
             if scaler is not None:
@@ -521,7 +489,6 @@ def run_video(
         total_loss_smooth += loss_smooth.item()
         total_loss_div    += loss_div.item()
         total_loss_attn   += attn_loss.item()
-        total_loss_next   += loss_next.item()
         correct, total = compute_accuracy(logits, labels, valid_mask)
         total_correct += correct
         total_frames  += total
@@ -541,7 +508,6 @@ def run_video(
         "loss_smooth": total_loss_smooth / num_clips,
         "loss_div":    total_loss_div    / num_clips,
         "loss_attn":   total_loss_attn   / num_clips,
-        "loss_next":   total_loss_next   / num_clips,
         "correct":       total_correct,
         "total":         total_frames,
         "phase_correct": phase_correct,
@@ -601,7 +567,6 @@ def main():
         epoch_loss_smooth = 0.0
         epoch_loss_div    = 0.0
         epoch_loss_attn   = 0.0
-        epoch_loss_next   = 0.0
         epoch_correct = 0
         epoch_total   = 0
         epoch_phase_correct = defaultdict(int)
@@ -620,7 +585,6 @@ def main():
             epoch_loss_smooth += result["loss_smooth"]
             epoch_loss_div    += result["loss_div"]
             epoch_loss_attn   += result["loss_attn"]
-            epoch_loss_next   += result["loss_next"]
             epoch_correct += result["correct"]
             epoch_total   += result["total"]
             for ph in range(cfg.data.num_phases):
@@ -641,13 +605,12 @@ def main():
 
         # Epoch-level train metrics
         n_vid = len(cfg.data.train_videos)
-        train_acc        = epoch_correct / max(1, epoch_total)
-        train_loss       = epoch_loss        / n_vid
-        train_loss_ce    = epoch_loss_ce     / n_vid
-        train_loss_smooth= epoch_loss_smooth / n_vid
-        train_loss_div   = epoch_loss_div    / n_vid
-        train_loss_attn  = epoch_loss_attn   / n_vid
-        train_loss_next  = epoch_loss_next   / n_vid
+        train_acc         = epoch_correct     / max(1, epoch_total)
+        train_loss        = epoch_loss        / n_vid
+        train_loss_ce     = epoch_loss_ce     / n_vid
+        train_loss_smooth = epoch_loss_smooth / n_vid
+        train_loss_div    = epoch_loss_div    / n_vid
+        train_loss_attn   = epoch_loss_attn   / n_vid
 
         wandb.log({
             "train/loss":        train_loss,
@@ -655,14 +618,13 @@ def main():
             "train/loss_smooth": train_loss_smooth,
             "train/loss_div":    train_loss_div,
             "train/loss_attn":   train_loss_attn,
-            "train/loss_next":   train_loss_next,
             "train/accuracy":    train_acc,
             "epoch":             epoch,
         })
 
         print(f"\n=== Epoch {epoch} Train | loss {train_loss:.4f} "
               f"(ce={train_loss_ce:.3f} sm={train_loss_smooth:.3f} "
-              f"div={train_loss_div:.3f} attn={train_loss_attn:.3f} next={train_loss_next:.3f})"
+              f"div={train_loss_div:.3f} attn={train_loss_attn:.3f})"
               f" | acc {train_acc:.4f} ===")
 
         # ── Validation ────────────────────────────────────────────────────────
