@@ -108,31 +108,48 @@ class MultiScaleCausalConvBlock(nn.Module):
 
 class CrossClipMemory(nn.Module):
     """
-    SSM-based cross-clip temporal memory.
+    SSM-based cross-clip temporal memory with selective retrieval.
 
-    Each clip, hint tokens are fed through a Mamba layer conditioned on the
-    previous clip's memory, producing an updated memory that summarizes all
-    clips seen so far. This memory is used as context prefix for the LLM in
-    the NEXT clip, replacing the raw hidden-state truncation approach.
+    Each clip:
+      1. Cross-attention (hints → prev_memory): current hints query into the
+         global memory to selectively retrieve only the past context that is
+         relevant to the current clip, rather than blindly consuming all history.
+      2. Mamba SSM: [prev_memory | enhanced_hints] → updated memory summary.
 
     Design:
-      - Input: [prev_memory | current_hints] concatenated along sequence dim
-      - Mamba processes left-to-right (causal SSM), so current positions attend
-        to all previous positions including past-clip memory
-      - Output: last N_hints positions = updated memory (residual with hints)
+      - hints (Q) × prev_memory (K/V) → retrieved  (selective read)
+      - enhanced_hints = hints + retrieved           (residual fusion)
+      - [prev_memory | enhanced_hints] → Mamba → last N positions = new_memory
 
     Args:
         d_model:  feature dimension (= d_llm)
+        n_heads:  number of attention heads for selective retrieval
         d_state:  SSM state size
         d_conv:   depthwise conv kernel size
         expand:   inner dimension expansion factor
     """
 
-    def __init__(self, d_model: int, d_state: int = 16, d_conv: int = 4, expand: int = 2):
+    def __init__(
+        self,
+        d_model: int,
+        n_heads: int = 8,
+        d_state: int = 16,
+        d_conv: int = 4,
+        expand: int = 2,
+    ):
         super().__init__()
-        self.norm = nn.LayerNorm(d_model)
-        self.mamba = Mamba(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)
-        self.out_norm = nn.LayerNorm(d_model)
+        # Cross-attention: current hints (Q) selectively read from prev_memory (K/V)
+        self.q_norm    = nn.LayerNorm(d_model)
+        self.kv_norm   = nn.LayerNorm(d_model)
+        self.cross_attn = nn.MultiheadAttention(
+            d_model, n_heads, batch_first=True
+        )
+        self.attn_norm = nn.LayerNorm(d_model)
+
+        # Mamba SSM: integrates enhanced hints with full memory history
+        self.mamba_norm = nn.LayerNorm(d_model)
+        self.mamba      = Mamba(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)
+        self.out_norm   = nn.LayerNorm(d_model)
 
     def forward(self, hints: torch.Tensor, prev_memory: torch.Tensor = None) -> torch.Tensor:
         """
@@ -143,61 +160,26 @@ class CrossClipMemory(nn.Module):
             memory: (B, N_hints, d_model) — updated memory for next clip
         """
         if prev_memory is not None:
-            # Prepend prev_memory so Mamba can condition current hints on past clips
-            x = torch.cat([prev_memory, hints], dim=1)  # (B, 2*N, d)
+            # 1. Selective retrieval: hints query into prev_memory
+            retrieved, _ = self.cross_attn(
+                self.q_norm(hints),
+                self.kv_norm(prev_memory),
+                self.kv_norm(prev_memory),
+            )
+            enhanced = self.attn_norm(hints + retrieved)  # (B, N, d)
+
+            # 2. Mamba update: full history context
+            x = torch.cat([prev_memory, enhanced], dim=1)  # (B, 2*N, d)
         else:
-            x = hints  # (B, N, d)
+            x = hints  # first clip: no memory to retrieve from
 
-        # Residual SSM: Mamba integrates temporal context left-to-right
-        x = x + self.mamba(self.norm(x))
+        # 3. Residual SSM
+        x = x + self.mamba(self.mamba_norm(x))
 
-        # Take the last N_hints positions: updated representation of current clip
+        # 4. Take the last N_hints positions as the new memory
         N = hints.shape[1]
-        memory = self.out_norm(x[:, -N:, :])  # (B, N_hints, d)
-        return memory
+        return self.out_norm(x[:, -N:, :])
 
-
-class MemoryFusion(nn.Module):
-    """
-    Cross-attention: memory queries into current visual tokens.
-
-    Past-clip memory acts as queries (Q) to extract relevant information
-    from the current clip's visual tokens (K/V). The output (N_hints tokens)
-    is prepended to the LLM input — giving the LLM a history-grounded view
-    of the current clip, distinct from the raw visual tokens.
-
-        Q = memory         (B, N, d_model)   — past clips summary (detached)
-        K = V = visual     (B, T, d_model)   — current clip visual tokens
-        Output             (B, N, d_model)   — what current clip offers to past memory
-
-    LLM input: [attended_memory(N) | tool_text | hints | visual_tokens]
-
-    Args:
-        d_model:  feature dimension (= d_llm)
-        n_heads:  number of attention heads
-        dropout:  attention dropout
-    """
-
-    def __init__(self, d_model: int, n_heads: int = 8, dropout: float = 0.0):
-        super().__init__()
-        self.q_norm  = nn.LayerNorm(d_model)
-        self.kv_norm = nn.LayerNorm(d_model)
-        self.cross_attn = nn.MultiheadAttention(
-            d_model, n_heads, dropout=dropout, batch_first=True
-        )
-        self.out_norm = nn.LayerNorm(d_model)
-
-    def forward(self, memory: torch.Tensor, visual_tokens: torch.Tensor) -> torch.Tensor:
-        """
-        memory:        (B, N, d_model) — previous clip's memory (detached), used as Q
-        visual_tokens: (B, T, d_model) — current clip's visual tokens, used as K/V
-
-        Returns: (B, N, d_model) — memory queries answered by current visual content
-        """
-        q  = self.q_norm(memory)
-        kv = self.kv_norm(visual_tokens)
-        attn_out, _ = self.cross_attn(q, kv, kv)
-        return self.out_norm(memory + attn_out)
 
 
 class LocalContextCompressor(nn.Module):

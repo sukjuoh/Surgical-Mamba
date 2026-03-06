@@ -373,32 +373,21 @@ def evaluate_test(model: SurgicalPhaseLLM, cfg, device: torch.device, epoch: int
 
     m = compute_cls_metrics(all_preds, all_labels, num_phases)
 
-    # Per-phase Jaccard table
-    phase_jaccard_str = "  ".join(
-        f"{CHOLEC80_PHASES[i][:6]}={m['per_phase_jaccard'][i]:.3f}"
-        for i in range(num_phases)
-    )
     print(
         f"\n{'='*60}\n"
         f"[TEST @ Epoch {epoch}]  (smooth={smooth_window}fr, min_seg={min_seg_len}fr)\n"
         f"  Acc={m['acc']:.4f}  Precision={m['precision']:.4f}"
         f"  Recall={m['recall']:.4f}  Jaccard={m['jaccard']:.4f}\n"
-        f"  Per-phase Jaccard: {phase_jaccard_str}\n"
         f"{'='*60}\n"
     )
 
-    log_dict = {
+    wandb.log({
         "test/acc":       m["acc"],
         "test/precision": m["precision"],
         "test/recall":    m["recall"],
         "test/jaccard":   m["jaccard"],
         "epoch":          epoch,
-    }
-    for i, ph in enumerate(CHOLEC80_PHASES):
-        log_dict[f"test/jaccard_{ph}"]   = m["per_phase_jaccard"][i]
-        log_dict[f"test/precision_{ph}"] = m["per_phase_precision"][i]
-        log_dict[f"test/recall_{ph}"]    = m["per_phase_recall"][i]
-    wandb.log(log_dict)
+    })
 
     return m
 
@@ -458,7 +447,12 @@ def run_video(
     )
 
     num_phases = cfg.data.num_phases
-    total_loss = 0.0
+    total_loss       = 0.0
+    total_loss_ce    = 0.0
+    total_loss_smooth= 0.0
+    total_loss_div   = 0.0
+    total_loss_attn  = 0.0
+    total_loss_next  = 0.0
     total_correct = 0
     total_frames  = 0
     phase_correct = defaultdict(int)
@@ -484,7 +478,7 @@ def run_video(
 
         with torch.set_grad_enabled(is_train):
             with autocast("cuda", enabled=(scaler is not None)):
-                logits, memory, prev_visual, hints, attn_loss, lm_phase_logits = model.forward_clip(
+                logits, memory, prev_visual, hints, attn_loss, nf_logits = model.forward_clip(
                     frames      = frames,
                     tool_annots = tools,
                     memory      = memory,
@@ -495,11 +489,9 @@ def run_video(
                                              label_smoothing=cfg.train.label_smoothing)
                 loss_smooth = temporal_smoothness_loss(logits, valid_mask)
                 loss_div    = hint_diversity_loss(hints)
-                # Auxiliary next-frame prediction via frozen lm_head:
-                # at position t, lm_phase_logits[t] predicts label[t+1].
-                # Forces reprogramming to produce representations that the
-                # LLM's own next-token head decodes as the upcoming phase.
-                loss_next   = next_frame_ce_loss(lm_phase_logits, labels, valid_mask,
+                # Auxiliary next-frame prediction via adaptation head:
+                # at position t, nf_logits[t] predicts label[t+1].
+                loss_next   = next_frame_ce_loss(nf_logits, labels, valid_mask,
                                                  label_smoothing=cfg.train.label_smoothing)
                 loss = (loss_ce
                         + cfg.train.w_smooth      * loss_smooth
@@ -524,7 +516,12 @@ def run_video(
                 scheduler.step()
 
         # Accumulate metrics
-        total_loss += loss.item()
+        total_loss        += loss.item()
+        total_loss_ce     += loss_ce.item()
+        total_loss_smooth += loss_smooth.item()
+        total_loss_div    += loss_div.item()
+        total_loss_attn   += attn_loss.item()
+        total_loss_next   += loss_next.item()
         correct, total = compute_accuracy(logits, labels, valid_mask)
         total_correct += correct
         total_frames  += total
@@ -537,9 +534,14 @@ def run_video(
                 phase_total[ph]   += ph_mask.sum().item()
                 phase_correct[ph] += (preds[ph_mask] == ph).sum().item()
 
-    num_clips = len(loader)
+    num_clips = max(1, len(loader))
     return {
-        "loss":          total_loss / max(1, num_clips),
+        "loss":        total_loss        / num_clips,
+        "loss_ce":     total_loss_ce     / num_clips,
+        "loss_smooth": total_loss_smooth / num_clips,
+        "loss_div":    total_loss_div    / num_clips,
+        "loss_attn":   total_loss_attn   / num_clips,
+        "loss_next":   total_loss_next   / num_clips,
         "correct":       total_correct,
         "total":         total_frames,
         "phase_correct": phase_correct,
@@ -594,7 +596,12 @@ def main():
     for epoch in range(1, cfg.train.epochs + 1):
         model.train()
 
-        epoch_loss    = 0.0
+        epoch_loss        = 0.0
+        epoch_loss_ce     = 0.0
+        epoch_loss_smooth = 0.0
+        epoch_loss_div    = 0.0
+        epoch_loss_attn   = 0.0
+        epoch_loss_next   = 0.0
         epoch_correct = 0
         epoch_total   = 0
         epoch_phase_correct = defaultdict(int)
@@ -608,7 +615,12 @@ def main():
                 model, video_id, cfg, device,
                 optimizer=optimizer, scheduler=scheduler, scaler=scaler, is_train=True,
             )
-            epoch_loss    += result["loss"]
+            epoch_loss        += result["loss"]
+            epoch_loss_ce     += result["loss_ce"]
+            epoch_loss_smooth += result["loss_smooth"]
+            epoch_loss_div    += result["loss_div"]
+            epoch_loss_attn   += result["loss_attn"]
+            epoch_loss_next   += result["loss_next"]
             epoch_correct += result["correct"]
             epoch_total   += result["total"]
             for ph in range(cfg.data.num_phases):
@@ -628,22 +640,30 @@ def main():
                 })
 
         # Epoch-level train metrics
-        train_acc = epoch_correct / max(1, epoch_total)
-        train_loss = epoch_loss / len(cfg.data.train_videos)
-        phase_accs = {
-            CHOLEC80_PHASES[ph]: epoch_phase_correct[ph] / max(1, epoch_phase_total[ph])
-            for ph in range(cfg.data.num_phases)
-        }
+        n_vid = len(cfg.data.train_videos)
+        train_acc        = epoch_correct / max(1, epoch_total)
+        train_loss       = epoch_loss        / n_vid
+        train_loss_ce    = epoch_loss_ce     / n_vid
+        train_loss_smooth= epoch_loss_smooth / n_vid
+        train_loss_div   = epoch_loss_div    / n_vid
+        train_loss_attn  = epoch_loss_attn   / n_vid
+        train_loss_next  = epoch_loss_next   / n_vid
 
-        log_dict = {
-            "train/epoch_loss": train_loss,
-            "train/accuracy":   train_acc,
-            "epoch":            epoch,
-        }
-        log_dict.update({f"train/acc_{ph}": acc for ph, acc in phase_accs.items()})
-        wandb.log(log_dict)
+        wandb.log({
+            "train/loss":        train_loss,
+            "train/loss_ce":     train_loss_ce,
+            "train/loss_smooth": train_loss_smooth,
+            "train/loss_div":    train_loss_div,
+            "train/loss_attn":   train_loss_attn,
+            "train/loss_next":   train_loss_next,
+            "train/accuracy":    train_acc,
+            "epoch":             epoch,
+        })
 
-        print(f"\n=== Epoch {epoch} Train | loss {train_loss:.4f} | acc {train_acc:.4f} ===")
+        print(f"\n=== Epoch {epoch} Train | loss {train_loss:.4f} "
+              f"(ce={train_loss_ce:.3f} sm={train_loss_smooth:.3f} "
+              f"div={train_loss_div:.3f} attn={train_loss_attn:.3f} next={train_loss_next:.3f})"
+              f" | acc {train_acc:.4f} ===")
 
         # ── Validation ────────────────────────────────────────────────────────
         if epoch % cfg.train.eval_interval == 0:

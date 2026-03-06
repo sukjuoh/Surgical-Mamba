@@ -64,19 +64,6 @@ CHOLEC80_PHASES = [
     "GallbladderRetraction",
 ]
 
-# Single representative word per phase for lm_head next-token phase prediction.
-# Each word tokenizes to exactly ONE token in Qwen2.5 (verified), so the lm_head
-# weight row carries a clean, unambiguous semantic vector for that phase concept.
-# inter-phase cosine similarity = 0.117 (sufficiently discriminative).
-PHASE_REPR_WORDS = [
-    "setup",    # Phase 0 - Preparation              (initial setup, trocar insertion)
-    "duct",     # Phase 1 - CalotTriangleDissection  (cystic duct exposure)
-    "clip",     # Phase 2 - ClippingCutting           (clip application)
-    "detach",   # Phase 3 - GallbladderDissection    (detach from liver bed)
-    "bag",      # Phase 4 - GallbladderPackaging      (specimen bag placement)
-    "wash",     # Phase 5 - CleaningCoagulation       (irrigation/washing)
-    "extract",  # Phase 6 - GallbladderRetraction    (specimen extraction)
-]
 
 CHOLEC80_TOOLS = [
     "Grasper",
@@ -276,21 +263,13 @@ class SurgicalPhaseLLM(nn.Module):
         self.output_dropout = nn.Dropout(output_dropout)
         self.output_head = nn.Linear(d_ff, num_phases)
 
-        # ── 9. LM-head phase token IDs (for auxiliary next-frame prediction) ──
-        # Each phase is represented by a single semantically-relevant word.
-        # The frozen lm_head weight row for that word encodes the LLM's
-        # language knowledge of that phase concept.
-        # Gradients flow through hidden states to the trainable projectors,
-        # forcing the reprogramming to produce representations that the
-        # LLM's OWN next-token head can decode as the upcoming phase.
-        token_ids = []
-        for word in PHASE_REPR_WORDS:
-            ids = self.tokenizer.encode(word, add_special_tokens=False)
-            token_ids.append(ids[0])  # first (usually only) token
-        self.register_buffer(
-            "phase_token_ids",
-            torch.tensor(token_ids, dtype=torch.long),
-        )  # (num_phases,)
+        # ── 9. Next-frame adaptation head ────────────────────────────────────
+        # Auxiliary trainable head that predicts label[t+1] from hidden[t].
+        # Uses the full d_llm representation (vs output_head which uses d_ff
+        # first dims), so it captures complementary information from the LLM.
+        # Gradient flows through this head → frozen LLM → trainable projectors,
+        # pushing reprogramming to encode phase-transition anticipation.
+        self.next_frame_head = nn.Linear(d_llm, num_phases)
 
     # ── Prompt KV cache ──────────────────────────────────────────────────────
 
@@ -463,19 +442,17 @@ class SurgicalPhaseLLM(nn.Module):
         frame_hidden = hidden[:, -T:, :self.d_ff].float()             # (B, T, d_ff)
         logits = self.output_head(self.output_dropout(frame_hidden))  # (B, T, num_phases)
 
-        # 8. LM-head auxiliary: next-token phase logits ───────────────────────
-        # Use the frozen lm_head to score each phase's representative word.
-        # lm_head.weight[phase_token_ids]: (num_phases, d_llm) — frozen.
-        # Gradients flow through frame_hidden_full into the trainable projectors,
-        # training reprogramming to produce representations the LLM's own
-        # next-token head can decode as the upcoming surgical phase.
-        frame_hidden_full = hidden[:, -T:, :].float()                 # (B, T, d_llm)
-        phase_w = self.llm.lm_head.weight[self.phase_token_ids].float()  # (num_phases, d_llm)
-        lm_phase_logits = frame_hidden_full @ phase_w.T               # (B, T, num_phases)
+        # 8. Next-frame auxiliary: adaptation head ────────────────────────────
+        # Trainable linear head over the full LLM hidden state at position t,
+        # predicting the phase at t+1. Gradient flows through frozen LLM layers
+        # back to the trainable projectors (ReprogrammingLayer, VisualProjector),
+        # pushing reprogramming to encode phase-transition anticipation.
+        frame_hidden_full = hidden[:, -T:, :].float()          # (B, T, d_llm)
+        nf_logits = self.next_frame_head(frame_hidden_full)    # (B, T, num_phases)
 
         return (
             logits, new_memory.detach(), visual_tokens.detach(),
-            hints, attn_focus_loss, lm_phase_logits,
+            hints, attn_focus_loss, nf_logits,
         )
 
     # ── Convenience ──────────────────────────────────────────────────────────
