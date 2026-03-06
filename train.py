@@ -39,25 +39,16 @@ def masked_ce_loss(
     logits: torch.Tensor,
     labels: torch.Tensor,
     mask: torch.Tensor,
-    label_smoothing: float = 0.1,
-    w_transition: float = 1.0,
+    label_smoothing: float = 0.0,
 ) -> torch.Tensor:
     """
-    Cross-entropy loss with label smoothing and optional transition weighting.
-
-    Label smoothing (α=0.1): softens hard targets to (1-α)*one_hot + α/C.
-
-    Transition weighting (w_transition > 1): frames where the phase label
-    changes from the previous or next frame are upweighted by w_transition.
-    Phase transitions are rare events (~handful per video) and easy to miss
-    with uniform CE; upweighting forces the model to pay attention to them.
+    Cross-entropy loss with label smoothing over valid frames.
 
     Args:
         logits:          (B, T, num_phases)
         labels:          (B, T)  int64
         mask:            (B, T)  bool, True = valid
         label_smoothing: smoothing factor (0 = standard CE)
-        w_transition:    weight multiplier for phase-transition frames (1 = off)
     """
     B, T, C = logits.shape
     logits_flat = logits.view(B * T, C)
@@ -69,44 +60,67 @@ def masked_ce_loss(
         label_smoothing=label_smoothing,
         reduction="none",
     )
-
-    if w_transition > 1.0:
-        # Frame t is a transition frame if its label differs from t-1 or t+1
-        prev_change = torch.cat([
-            labels.new_zeros(B, 1, dtype=torch.bool),
-            labels[:, 1:] != labels[:, :-1],
-        ], dim=1)                                           # (B, T)
-        next_change = torch.cat([
-            labels[:, :-1] != labels[:, 1:],
-            labels.new_zeros(B, 1, dtype=torch.bool),
-        ], dim=1)                                           # (B, T)
-        transition = (prev_change | next_change).float()   # (B, T)  1 at boundaries
-        weights = (1.0 + (w_transition - 1.0) * transition).view(B * T)
-        loss = loss * weights
-
     return loss[mask_flat].mean()
+
+
+def next_frame_ce_loss(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    mask: torch.Tensor,
+    label_smoothing: float = 0.0,
+) -> torch.Tensor:
+    """
+    Auxiliary next-frame phase prediction loss.
+
+    At position t, use logits[t] to predict label[t+1].
+    Forces the model to anticipate upcoming phases — directly learns phase
+    transition signals without any heuristic weighting.
+
+    Only valid where both frame t and t+1 have valid labels.
+
+    Args:
+        logits:          (B, T, num_phases)
+        labels:          (B, T)  int64
+        mask:            (B, T)  bool, True = valid
+        label_smoothing: smoothing factor
+    """
+    B, T, C = logits.shape
+
+    # logits at t predicting labels at t+1
+    logits_shifted = logits[:, :-1].reshape(-1, C)   # (B*(T-1), C)
+    labels_shifted = labels[:, 1:].reshape(-1)        # (B*(T-1),)
+    pair_mask      = (mask[:, :-1] & mask[:, 1:]).reshape(-1)  # (B*(T-1),)
+
+    if pair_mask.sum() == 0:
+        return logits.new_tensor(0.0)
+
+    loss = nn.functional.cross_entropy(
+        logits_shifted, labels_shifted,
+        label_smoothing=label_smoothing,
+        reduction="none",
+    )
+    return loss[pair_mask].mean()
 
 
 def temporal_smoothness_loss(
     logits: torch.Tensor,
     mask: torch.Tensor,
-    labels: torch.Tensor = None,
 ) -> torch.Tensor:
     """
-    Penalise abrupt changes in predicted phase distribution between adjacent frames,
-    applied only within same-phase pairs.
+    Penalise abrupt changes in predicted phase distribution between all adjacent frames.
 
     Uses KL divergence between consecutive softmax outputs:
-        L_smooth = mean KL(p_t || p_{t+1})  over valid same-phase adjacent pairs
+        L_smooth = mean KL(p_t || p_{t+1})  over all valid adjacent pairs
 
-    Restricting to same-phase pairs avoids fighting against legitimate transitions:
-    without this, the loss would penalise the model for correctly predicting a
-    sharp boundary, directly opposing transition-weighted CE.
+    Applied to ALL pairs (including phase-transition boundaries), so it:
+      - suppresses oscillation within a phase (consistency)
+      - encourages gradual distribution shift at transitions rather than sudden jumps
+    Works in tandem with next_frame_ce_loss: next_frame_ce teaches WHEN to transition,
+    smooth loss ensures the transition happens GRADUALLY.
 
     Args:
         logits: (B, T, num_phases)
         mask:   (B, T) bool, True = valid
-        labels: (B, T) int64, phase labels — if provided, only same-phase pairs used
     Returns:
         scalar loss
     """
@@ -115,11 +129,6 @@ def temporal_smoothness_loss(
 
     # Adjacent-pair mask: both t and t+1 must be valid
     pair_mask = mask[:, :-1] & mask[:, 1:]              # (B, T-1)
-
-    # Restrict to same-phase pairs so we never penalise true transitions
-    if labels is not None:
-        same_phase = (labels[:, :-1] == labels[:, 1:])  # (B, T-1)
-        pair_mask  = pair_mask & same_phase
 
     # KL(p_t || p_{t+1}) = sum p_t * (log p_t - log p_{t+1})
     kl = (probs[:, :-1] * (log_probs[:, :-1] - log_probs[:, 1:])).sum(-1)  # (B, T-1)
@@ -165,6 +174,233 @@ def compute_accuracy(logits: torch.Tensor, labels: torch.Tensor, mask: torch.Ten
     correct = (valid_preds == valid_labels).sum().item()
     total   = valid_labels.numel()
     return correct, total
+
+
+# ── Test-time inference utilities ─────────────────────────────────────────────
+
+@torch.no_grad()
+def run_video_inference(
+    model: SurgicalPhaseLLM,
+    video_id: int,
+    cfg,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Collect per-frame logits and labels for an entire video (no grad).
+
+    Processes clips sequentially (carrying memory/prev_visual like training),
+    then concatenates only the *valid* frames across all clips.
+
+    Returns:
+        all_logits: (N_valid, num_phases)  — raw logits on CPU
+        all_labels: (N_valid,)             — ground-truth labels on CPU
+    """
+    dataset = VideoClipDataset(
+        video_id   = video_id,
+        data_root  = cfg.data.data_root,
+        phase_dir  = cfg.data.phase_annotation_dir,
+        tool_dir   = cfg.data.tool_annotation_dir,
+        seq_len    = cfg.data.seq_len,
+        img_size   = cfg.data.img_size,
+    )
+    loader = DataLoader(
+        dataset,
+        batch_size  = 1,
+        shuffle     = False,
+        num_workers = cfg.train.num_workers,
+        pin_memory  = True,
+    )
+
+    prompt_kv   = model.build_prompt_kv()
+    memory      = None
+    prev_visual = None
+
+    all_logits = []
+    all_labels = []
+
+    for frames, tools, labels, valid_mask in loader:
+        frames     = frames.to(device)
+        tools      = tools.to(device)
+        labels     = labels.to(device)
+        valid_mask = valid_mask.to(device)
+
+        logits, memory, prev_visual, _, _, _ = model.forward_clip(
+            frames      = frames,
+            tool_annots = tools,
+            memory      = memory,
+            prev_visual = prev_visual,
+            prompt_kv   = prompt_kv,
+        )
+
+        # Collect only valid frames (B=1, so squeeze)
+        mask_sq  = valid_mask[0]              # (T,)
+        logits_v = logits[0][mask_sq]         # (N_valid, num_phases)
+        labels_v = labels[0][mask_sq]         # (N_valid,)
+        all_logits.append(logits_v.cpu())
+        all_labels.append(labels_v.cpu())
+
+    return torch.cat(all_logits, dim=0), torch.cat(all_labels, dim=0)
+
+
+def temporal_smooth_logits(logits: torch.Tensor, window: int = 15) -> torch.Tensor:
+    """
+    Soft temporal smoothing: average softmax probabilities over a sliding window.
+
+    Applies symmetric avg-pool over the time axis so each frame's final
+    probability is the mean of its ±(window//2) neighbours.  Preserves
+    temporal length exactly.
+
+    Args:
+        logits: (N, C) — raw per-frame logits
+        window: sliding window size (odd recommended)
+    Returns:
+        (N, C) — smoothed probability vectors (sum to 1 along C)
+    """
+    probs = torch.softmax(logits, dim=-1)               # (N, C)
+    # avg_pool1d expects (B, C, L) — treat frames as the length dimension
+    probs_t  = probs.T.unsqueeze(0)                     # (1, C, N)
+    pad      = window // 2
+    smoothed = nn.functional.avg_pool1d(
+        probs_t, kernel_size=window, stride=1, padding=pad
+    )
+    return smoothed.squeeze(0).T                        # (N, C)
+
+
+def remove_short_segments(preds: torch.Tensor, min_len: int = 10) -> torch.Tensor:
+    """
+    Remove phase segments shorter than min_len frames.
+
+    Short isolated segments (e.g., a 3-frame "blip" of phase 2 inside phase 1)
+    are replaced by the left neighbour (or right neighbour at the video start).
+    Iterates until no segment shorter than min_len remains.
+
+    Args:
+        preds:   (N,) int64 frame-level predictions
+        min_len: minimum acceptable segment length in frames
+    Returns:
+        (N,) cleaned predictions
+    """
+    p = preds.tolist()
+    N = len(p)
+    changed = True
+    while changed:
+        changed = False
+        i = 0
+        while i < N:
+            ph = p[i]
+            j  = i
+            while j < N and p[j] == ph:
+                j += 1
+            if (j - i) < min_len:
+                # Replace with left neighbour; fall back to right if at start
+                fill = p[i - 1] if i > 0 else (p[j] if j < N else ph)
+                for k in range(i, j):
+                    p[k] = fill
+                changed = True
+            i = j
+    return torch.tensor(p, dtype=preds.dtype)
+
+
+def compute_cls_metrics(
+    preds: torch.Tensor,
+    labels: torch.Tensor,
+    num_phases: int,
+) -> dict:
+    """
+    Compute frame-level acc, macro precision, recall, Jaccard.
+
+    All metrics are macro-averaged across phases (equal weight per phase,
+    regardless of class frequency) — standard for surgical phase evaluation.
+
+    Returns dict with keys: acc, precision, recall, jaccard,
+                            per_phase_precision, per_phase_recall, per_phase_jaccard
+    """
+    acc = (preds == labels).float().mean().item()
+
+    precisions, recalls, jaccards = [], [], []
+    for c in range(num_phases):
+        tp = ((preds == c) & (labels == c)).sum().item()
+        fp = ((preds == c) & (labels != c)).sum().item()
+        fn = ((preds != c) & (labels == c)).sum().item()
+
+        precisions.append(tp / (tp + fp) if (tp + fp) > 0 else 0.0)
+        recalls.append(   tp / (tp + fn) if (tp + fn) > 0 else 0.0)
+        jaccards.append(  tp / (tp + fp + fn) if (tp + fp + fn) > 0 else 0.0)
+
+    return {
+        "acc":                acc,
+        "precision":          sum(precisions) / num_phases,
+        "recall":             sum(recalls)    / num_phases,
+        "jaccard":            sum(jaccards)   / num_phases,
+        "per_phase_precision": precisions,
+        "per_phase_recall":    recalls,
+        "per_phase_jaccard":   jaccards,
+    }
+
+
+@torch.no_grad()
+def evaluate_test(model: SurgicalPhaseLLM, cfg, device: torch.device, epoch: int):
+    """
+    Evaluate on test videos with accuracy-boosting post-processing:
+      1. Temporal soft smoothing  (sliding window probability average)
+      2. Short-segment removal    (merge isolated phase blips)
+
+    Reports: acc, macro precision, recall, Jaccard — printed and logged to WandB.
+    """
+    smooth_window = cfg.train.get("test_smooth_window", 15)
+    min_seg_len   = cfg.train.get("test_min_segment",  10)
+    num_phases    = cfg.data.num_phases
+
+    all_preds  = []
+    all_labels = []
+
+    model.eval()
+    for video_id in cfg.data.test_videos:
+        logits, labels = run_video_inference(model, video_id, cfg, device)
+
+        # 1. Temporal soft smoothing
+        smoothed = temporal_smooth_logits(logits, window=smooth_window)  # (N, C)
+        preds    = smoothed.argmax(dim=-1)                                # (N,)
+
+        # 2. Short-segment removal
+        preds = remove_short_segments(preds, min_len=min_seg_len)
+
+        all_preds.append(preds)
+        all_labels.append(labels)
+
+    all_preds  = torch.cat(all_preds,  dim=0)
+    all_labels = torch.cat(all_labels, dim=0)
+
+    m = compute_cls_metrics(all_preds, all_labels, num_phases)
+
+    # Per-phase Jaccard table
+    phase_jaccard_str = "  ".join(
+        f"{CHOLEC80_PHASES[i][:6]}={m['per_phase_jaccard'][i]:.3f}"
+        for i in range(num_phases)
+    )
+    print(
+        f"\n{'='*60}\n"
+        f"[TEST @ Epoch {epoch}]  (smooth={smooth_window}fr, min_seg={min_seg_len}fr)\n"
+        f"  Acc={m['acc']:.4f}  Precision={m['precision']:.4f}"
+        f"  Recall={m['recall']:.4f}  Jaccard={m['jaccard']:.4f}\n"
+        f"  Per-phase Jaccard: {phase_jaccard_str}\n"
+        f"{'='*60}\n"
+    )
+
+    log_dict = {
+        "test/acc":       m["acc"],
+        "test/precision": m["precision"],
+        "test/recall":    m["recall"],
+        "test/jaccard":   m["jaccard"],
+        "epoch":          epoch,
+    }
+    for i, ph in enumerate(CHOLEC80_PHASES):
+        log_dict[f"test/jaccard_{ph}"]   = m["per_phase_jaccard"][i]
+        log_dict[f"test/precision_{ph}"] = m["per_phase_precision"][i]
+        log_dict[f"test/recall_{ph}"]    = m["per_phase_recall"][i]
+    wandb.log(log_dict)
+
+    return m
 
 
 def build_optimizer(model: SurgicalPhaseLLM, cfg):
@@ -248,7 +484,7 @@ def run_video(
 
         with torch.set_grad_enabled(is_train):
             with autocast("cuda", enabled=(scaler is not None)):
-                logits, memory, prev_visual, hints, attn_loss = model.forward_clip(
+                logits, memory, prev_visual, hints, attn_loss, lm_phase_logits = model.forward_clip(
                     frames      = frames,
                     tool_annots = tools,
                     memory      = memory,
@@ -256,14 +492,20 @@ def run_video(
                     prompt_kv   = prompt_kv,
                 )
                 loss_ce     = masked_ce_loss(logits, labels, valid_mask,
-                                             label_smoothing=cfg.train.label_smoothing,
-                                             w_transition=cfg.train.w_transition)
-                loss_smooth = temporal_smoothness_loss(logits, valid_mask, labels=labels)
+                                             label_smoothing=cfg.train.label_smoothing)
+                loss_smooth = temporal_smoothness_loss(logits, valid_mask)
                 loss_div    = hint_diversity_loss(hints)
+                # Auxiliary next-frame prediction via frozen lm_head:
+                # at position t, lm_phase_logits[t] predicts label[t+1].
+                # Forces reprogramming to produce representations that the
+                # LLM's own next-token head decodes as the upcoming phase.
+                loss_next   = next_frame_ce_loss(lm_phase_logits, labels, valid_mask,
+                                                 label_smoothing=cfg.train.label_smoothing)
                 loss = (loss_ce
-                        + cfg.train.w_smooth     * loss_smooth
-                        + cfg.train.w_diversity  * loss_div
-                        + cfg.train.w_attn_focus * attn_loss)
+                        + cfg.train.w_smooth      * loss_smooth
+                        + cfg.train.w_diversity   * loss_div
+                        + cfg.train.w_attn_focus  * attn_loss
+                        + cfg.train.w_next_frame  * loss_next)
 
         if is_train:
             if scaler is not None:
@@ -450,6 +692,12 @@ def main():
                     "cfg":        OmegaConf.to_container(cfg),
                 }, ckpt_path)
                 print(f"  Saved best checkpoint → {ckpt_path} (val_acc={val_acc:.4f})")
+
+        # ── Test evaluation (every test_eval_interval epochs) ─────────────────
+        test_interval = cfg.train.get("test_eval_interval", 10)
+        if epoch % test_interval == 0:
+            evaluate_test(model, cfg, device, epoch)
+            model.train()   # restore train mode after evaluation
 
         # Save latest checkpoint every epoch
         torch.save({

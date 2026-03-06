@@ -64,6 +64,22 @@ CHOLEC80_PHASES = [
     "GallbladderRetraction",
 ]
 
+# Single representative word per phase for lm_head next-token phase prediction.
+# Each word must tokenize to a single token in the LLM vocabulary so the
+# lm_head weight row carries unambiguous semantic signal for that phase.
+# Words are chosen to be maximally discriminative across all 7 phases:
+#   Phase 1 vs Phase 3 both involve dissection — use "cystic" (cystic duct/artery)
+#   vs "hepatic" (liver bed) to distinguish them at the lm_head embedding level.
+PHASE_REPR_WORDS = [
+    "preparation",   # Phase 0 - Preparation         (trocar insertion, setup)
+    "cystic",        # Phase 1 - CalotTriangleDissection (cystic duct/artery exposure)
+    "clipping",      # Phase 2 - ClippingCutting      (clip application + cutting)
+    "hepatic",       # Phase 3 - GallbladderDissection (dissection from liver/hepatic bed)
+    "packaging",     # Phase 4 - GallbladderPackaging  (specimen bag placement)
+    "irrigation",    # Phase 5 - CleaningCoagulation   (irrigator use is distinctive)
+    "retraction",    # Phase 6 - GallbladderRetraction (extraction of specimen)
+]
+
 CHOLEC80_TOOLS = [
     "Grasper",
     "Bipolar",
@@ -79,8 +95,6 @@ _DEFAULT_PROMPT = (
     "Dataset description: Laparoscopic cholecystectomy surgical video recorded at 1 fps. "
     "Task description: Recognize the surgical phase label for each video frame token "
     "given the sequence of visual feature tokens. "
-    "The 7 surgical phases always progress in strict sequential order "
-    "(0 -> 1 -> 2 -> 3 -> 4 -> 5 -> 6) and never repeat or skip within a procedure. "
     "Phase 0 - Preparation: initial setup and trocar insertion before the procedure begins. "
     "Phase 1 - CalotTriangleDissection: dissection of peritoneum around the Calot triangle "
     "to expose the cystic duct and artery. "
@@ -165,7 +179,6 @@ class SurgicalPhaseLLM(nn.Module):
         num_tokens: int = 1000,
         n_hints: int = 8,
         local_context_ratio: int = 4,
-        conv_kernel_size: int = 15,
         prompt: str = _DEFAULT_PROMPT,
         attention_dropout: float = 0.1,
         hint_dropout: float = 0.1,
@@ -190,7 +203,6 @@ class SurgicalPhaseLLM(nn.Module):
         self.temporal_refiner = TemporalRefiner(
             d_model=self.d_visual,
             num_layers=mamba_layers,
-            conv_kernel_size=conv_kernel_size,
         )
 
         # ── 3. LLM (frozen by default) ───────────────────────────────────────
@@ -265,6 +277,22 @@ class SurgicalPhaseLLM(nn.Module):
         # ── 8. Output head ───────────────────────────────────────────────────
         self.output_dropout = nn.Dropout(output_dropout)
         self.output_head = nn.Linear(d_ff, num_phases)
+
+        # ── 9. LM-head phase token IDs (for auxiliary next-frame prediction) ──
+        # Each phase is represented by a single semantically-relevant word.
+        # The frozen lm_head weight row for that word encodes the LLM's
+        # language knowledge of that phase concept.
+        # Gradients flow through hidden states to the trainable projectors,
+        # forcing the reprogramming to produce representations that the
+        # LLM's OWN next-token head can decode as the upcoming phase.
+        token_ids = []
+        for word in PHASE_REPR_WORDS:
+            ids = self.tokenizer.encode(word, add_special_tokens=False)
+            token_ids.append(ids[0])  # first (usually only) token
+        self.register_buffer(
+            "phase_token_ids",
+            torch.tensor(token_ids, dtype=torch.long),
+        )  # (num_phases,)
 
     # ── Prompt KV cache ──────────────────────────────────────────────────────
 
@@ -437,7 +465,20 @@ class SurgicalPhaseLLM(nn.Module):
         frame_hidden = hidden[:, -T:, :self.d_ff].float()             # (B, T, d_ff)
         logits = self.output_head(self.output_dropout(frame_hidden))  # (B, T, num_phases)
 
-        return logits, new_memory.detach(), visual_tokens.detach(), hints, attn_focus_loss
+        # 8. LM-head auxiliary: next-token phase logits ───────────────────────
+        # Use the frozen lm_head to score each phase's representative word.
+        # lm_head.weight[phase_token_ids]: (num_phases, d_llm) — frozen.
+        # Gradients flow through frame_hidden_full into the trainable projectors,
+        # training reprogramming to produce representations the LLM's own
+        # next-token head can decode as the upcoming surgical phase.
+        frame_hidden_full = hidden[:, -T:, :].float()                 # (B, T, d_llm)
+        phase_w = self.llm.lm_head.weight[self.phase_token_ids].float()  # (num_phases, d_llm)
+        lm_phase_logits = frame_hidden_full @ phase_w.T               # (B, T, num_phases)
+
+        return (
+            logits, new_memory.detach(), visual_tokens.detach(),
+            hints, attn_focus_loss, lm_phase_logits,
+        )
 
     # ── Convenience ──────────────────────────────────────────────────────────
 
@@ -445,7 +486,7 @@ class SurgicalPhaseLLM(nn.Module):
         """Single-clip forward without temporal context (for quick testing)."""
         if self._prompt_kv is None:
             self.build_prompt_kv()
-        logits, _, _, _, _ = self.forward_clip(frames, tool_annots=tool_annots)
+        logits, _, _, _, _, _ = self.forward_clip(frames, tool_annots=tool_annots)
         return logits
 
     # ── Config factory ───────────────────────────────────────────────────────
@@ -466,7 +507,6 @@ class SurgicalPhaseLLM(nn.Module):
             num_tokens       = m.num_tokens,
             n_hints          = m.n_hints,
             local_context_ratio = m.local_context_ratio,
-            conv_kernel_size    = m.conv_kernel_size,
             prompt           = m.prompt,
             attention_dropout= m.attention_dropout,
             hint_dropout     = m.hint_dropout,
