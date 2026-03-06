@@ -94,7 +94,7 @@ data:
   phase_annotation_dir: "phase_annotations_preprocessed"
   tool_annotation_dir: "tool_annotations_preprocessed"
   img_size: 224
-  seq_len: 256                     # T: number of frames (tokens) per clip
+  seq_len: 192                     # T: number of frames (tokens) per clip
   num_phases: 7
 
   # CholecT80 standard split
@@ -103,7 +103,7 @@ data:
   #val_videos:   [41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,
   #               61,62,63,64,65,66,67,68,69,70,71,72,73,74,75,76,77,78,79,80]
   val_videos:   [41,42,43,44,45,46,47,48]
-  test_videos:  [49,50,51,52,53,54,55,56,57,58,59,60,
+  test_videos:  [41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,
                  61,62,63,64,65,66,67,68,69,70,71,72,73,74,75,76,77,78,79,80]
 
 
