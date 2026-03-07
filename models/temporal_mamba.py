@@ -1,37 +1,19 @@
 """
 Temporal refinement for 1D visual token sequences.
 
-MultiScaleCausalConvBlock replaces the single-scale CausalConvBlock.
+BidirectionalMambaBlock:
+  Forward Mamba + Backward Mamba, outputs concatenated and projected to d_model.
+  Sees the full clip context in both directions — unlike causal conv which is
+  limited to a 43-frame receptive field.
 
-Design — three parallel dilated depthwise convolutions:
-  dilation=1, k=7 →  7-frame receptive field  (immediate neighbourhood)
-  dilation=3, k=7 → 19-frame receptive field  (short-term dynamics)
-  dilation=7, k=7 → 43-frame receptive field  (mid-term context)
+  forward scan:  left-to-right SSM  (past → present)
+  backward scan: x.flip(1) → SSM → flip  (future → present)
+  out = Linear(d_model*2 → d_model) + FFN
 
-  Outputs are summed then mixed via pointwise conv.
-  A single kernel=15 block covers only one scale; parallel dilated convs
-  cover three scales at essentially the same FLOPs (all depthwise/grouped).
-
-Frame-delta injection (TemporalRefiner):
-  Δx[t] = x[t] - x[t-1] projected and added BEFORE the conv blocks.
-  Kept purely additive — not used as a multiplicative gate — to avoid
-  amplifying clip-boundary delta artifacts during online inference.
-
-Online inference buffers (per scale, per block):
-  scale 1: buffer of 6  past frames  (= (7-1)*1)
-  scale 2: buffer of 18 past frames  (= (7-1)*3)
-  scale 3: buffer of 42 past frames  (= (7-1)*7)
-  Prepend buffer → conv → take last position. Zero train/inference gap.
-
-# ── Previously: single-scale CausalConvBlock (kernel_size=15) ────────────────
-# Replaced: fixed 15-frame field too coarse; could not simultaneously
-# capture immediate motion and multi-second trends.
-# ─────────────────────────────────────────────────────────────────────────────
-
-# ── Previously: Bidirectional Mamba ──────────────────────────────────────────
-# Replaced: bidirectional SSM requires full sequence at inference
-# (train/inference gap for online use) and is slower than depthwise conv.
-# ─────────────────────────────────────────────────────────────────────────────
+TemporalRefiner:
+  Stack of BidirectionalMambaBlocks. No frame-delta injection — avoids
+  augmentation-induced per-frame noise (random crop/flip differ per frame).
+  Mamba SSM naturally captures temporal change via selective state updates.
 """
 
 import torch
@@ -40,46 +22,26 @@ import torch.nn.functional as F
 from mamba_ssm import Mamba  # still needed for CrossClipMemory
 
 
-class MultiScaleCausalConvBlock(nn.Module):
+class BidirectionalMambaBlock(nn.Module):
     """
-    Multi-scale causal depthwise conv block: 3×DWConv(dilated) → sum → Pointwise → FFN.
+    Bidirectional Mamba block: forward SSM + backward SSM over the full sequence.
 
-    Three parallel dilated depthwise convolutions with kernel=7:
-      (dilation=1) → 7-frame receptive field
-      (dilation=3) → 19-frame receptive field
-      (dilation=7) → 43-frame receptive field
-
-    Causal padding per scale: left-pad by (kernel-1)*dilation, trim right to T.
-    Outputs are summed (same shape, no extra mixing) then passed through
-    a pointwise linear and FFN with residuals.
-
-    All convolutions are depthwise (groups=d_model) — negligible FLOPs vs
-    a single kernel=15 block; parameter count is +2 DWConv weight vectors.
-
-    Online buffer per scale: (kernel-1)*dilation = 6 / 18 / 42 past frames.
+    Both scans share the same input; their outputs are concatenated and projected
+    back to d_model, giving each frame access to full past and future context.
 
     Args:
-        d_model: feature dimension (e.g. 768)
+        d_model:  feature dimension (e.g. 768)
+        d_state:  SSM state size
+        d_conv:   depthwise conv kernel inside Mamba
+        expand:   inner dimension expansion factor
     """
 
-    # (kernel_size, dilation) — fixed, no config needed
-    _SCALES = [(7, 1), (7, 3), (7, 7)]
-
-    def __init__(self, d_model: int):
+    def __init__(self, d_model: int, d_state: int = 16, d_conv: int = 4, expand: int = 2):
         super().__init__()
         self.norm = nn.LayerNorm(d_model)
-
-        # Parallel dilated DWConvs — each causal via left-padding
-        self.dw_convs = nn.ModuleList([
-            nn.Conv1d(
-                d_model, d_model, kernel_size=k,
-                dilation=d, padding=(k - 1) * d, groups=d_model,
-            )
-            for k, d in self._SCALES
-        ])
-
-        # Pointwise: mix channels after multi-scale aggregation
-        self.pw_conv = nn.Linear(d_model, d_model)
+        self.mamba_fwd = Mamba(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)
+        self.mamba_bwd = Mamba(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)
+        self.out_proj = nn.Linear(d_model * 2, d_model)
 
         self.ffn_norm = nn.LayerNorm(d_model)
         self.ffn = nn.Sequential(
@@ -90,18 +52,11 @@ class MultiScaleCausalConvBlock(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: (B, T, d_model) → (B, T, d_model)"""
-        B, T, d = x.shape
-
         normed = self.norm(x)
-        h = normed.transpose(1, 2)                        # (B, d, T)
-
-        # Sum multi-scale outputs; each causal: trim to T
-        h = sum(conv(h)[:, :, :T] for conv in self.dw_convs)  # (B, d, T)
-
-        h = h.transpose(1, 2)                             # (B, T, d)
-        h = self.pw_conv(h)
+        fwd = self.mamba_fwd(normed)                      # (B, T, d_model)
+        bwd = self.mamba_bwd(normed.flip(1)).flip(1)      # (B, T, d_model)
+        h = self.out_proj(torch.cat([fwd, bwd], dim=-1))  # (B, T, d_model)
         x = x + h
-
         x = x + self.ffn(self.ffn_norm(x))
         return x
 
@@ -232,37 +187,29 @@ class LocalContextCompressor(nn.Module):
 
 class TemporalRefiner(nn.Module):
     """
-    Stack of N MultiScaleCausalConvBlocks for temporal refinement of visual tokens.
+    Stack of N BidirectionalMambaBlocks for temporal refinement of visual tokens.
 
-    Prepends a frame-delta injection step: the per-frame visual difference
-    x[t] - x[t-1] is projected and added to the input (purely additive —
-    not used as a gate, to avoid clip-boundary artifacts in online mode).
+    Each block runs forward and backward Mamba scans over the full clip,
+    giving each frame access to all past and future context within the clip.
 
     Input:  (B, T, d_model)  — raw VMamba per-frame features
     Output: (B, T, d_model)  — temporally-refined features
 
     Args:
         d_model:    feature dimension
-        num_layers: number of stacked MultiScaleCausalConvBlocks
+        num_layers: number of stacked BidirectionalMambaBlocks
     """
 
     def __init__(self, d_model: int, num_layers: int = 2):
         super().__init__()
-        # Frame-delta: projects Δx[t] = x[t] - x[t-1] into the feature space
-        self.delta_proj = nn.Linear(d_model, d_model, bias=False)
-
         self.layers = nn.ModuleList([
-            MultiScaleCausalConvBlock(d_model)
+            BidirectionalMambaBlock(d_model)
             for _ in range(num_layers)
         ])
         self.final_norm = nn.LayerNorm(d_model)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: (B, T, d_model) → (B, T, d_model)"""
-        # Frame-delta injection: Δx[0] = 0, Δx[t] = x[t] - x[t-1]
-        delta = torch.diff(x, dim=1, prepend=x[:, :1, :])
-        x = x + self.delta_proj(delta)
-
         for layer in self.layers:
             x = layer(x)
         return self.final_norm(x)

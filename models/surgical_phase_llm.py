@@ -163,6 +163,7 @@ class SurgicalPhaseLLM(nn.Module):
         freeze_llm: bool = True,
         llm_trainable_layers: int = 0,
         freeze_vmamba: bool = False,
+        use_mapping_layer: bool = True,
         vmamba_trainable_stages: int = 0,
         mamba_layers: int = 2,
         n_heads: int = 8,
@@ -232,7 +233,16 @@ class SurgicalPhaseLLM(nn.Module):
         # Semantic reprogramming path
         word_emb_weight = self.llm.get_input_embeddings().weight  # (V, d_llm)
         self.vocab_size = word_emb_weight.shape[0]
-        self.mapping_layer = nn.Linear(self.vocab_size, num_tokens)
+        self.use_mapping_layer = use_mapping_layer
+        if use_mapping_layer:
+            # Learnable: 151M-param matrix selects num_tokens from full vocab
+            self.mapping_layer = nn.Linear(self.vocab_size, num_tokens)
+        else:
+            # Frozen: directly use first num_tokens LLM embeddings as K/V
+            self.register_buffer(
+                "src_word_embeddings",
+                word_emb_weight[:num_tokens].detach().float()
+            )
         self.reprogramming = ReprogrammingLayer(
             d_model=self.d_visual,
             n_heads=n_heads,
@@ -402,8 +412,11 @@ class SurgicalPhaseLLM(nn.Module):
 
         # 3. Visual projector (transformer block style) ───────────────────────
         direct   = self.linear_proj(feats)                             # (B, T, d_llm)
-        src_emb  = self.mapping_layer(
-            self.word_embeddings.permute(1, 0)).permute(1, 0)          # (num_tokens, d_llm)
+        if self.use_mapping_layer:
+            src_emb = self.mapping_layer(
+                self.word_embeddings.permute(1, 0)).permute(1, 0)      # (num_tokens, d_llm)
+        else:
+            src_emb = self.src_word_embeddings                         # (num_tokens, d_llm)
         reprogram = self.reprogramming(feats, src_emb)                 # (B, T, d_llm)
 
         # Residual 1: fusion
@@ -492,6 +505,7 @@ class SurgicalPhaseLLM(nn.Module):
             freeze_llm              = m.freeze_llm,
             llm_trainable_layers    = m.get("llm_trainable_layers", 0),
             freeze_vmamba           = m.freeze_vmamba,
+            use_mapping_layer       = m.get("use_mapping_layer", True),
             vmamba_trainable_stages = m.get("vmamba_trainable_stages", 0),
             mamba_layers            = m.mamba_layers,
             n_heads          = m.n_heads,

@@ -34,7 +34,8 @@ model:
 
   # ── Freeze settings ───────────────────────────────────────────────────────
   freeze_llm: true                 # freeze LLM (early layers)
-  llm_trainable_layers: 4          # unfreeze last N transformer layers (0=fully frozen)
+  llm_trainable_layers: 0          # unfreeze last N transformer layers (0=fully frozen)
+  use_mapping_layer: false         # true=trainable 151M vocab→num_tokens, false=frozen LLM embeddings (TimesLLM style)
   freeze_vmamba: true              # freeze VMamba backbone (early stages)
   vmamba_trainable_stages: 1       # unfreeze last N stages (0=fully frozen, 1=last stage only)
 

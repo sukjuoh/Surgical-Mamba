@@ -434,8 +434,12 @@ def run_video(
     phase_correct = defaultdict(int)
     phase_total   = defaultdict(int)
 
-    # Build prompt KV once per video (fixed prompt, reused across all clips)
-    prompt_kv   = model.build_prompt_kv()
+    # When LLM layers are trainable, prompt_kv must be rebuilt each clip
+    # (weights change after each optimizer step, cached KV would be stale).
+    # When LLM is fully frozen, build once per video for efficiency.
+    llm_is_trainable = any(p.requires_grad for p in model.llm.parameters())
+    prompt_kv_static = None if (is_train and llm_is_trainable) else model.build_prompt_kv()
+
     memory      = None  # CrossClipMemory global state, reset per video
     prev_visual = None  # Previous clip's visual_tokens, reset per video
 
@@ -451,6 +455,10 @@ def run_video(
 
         if is_train:
             optimizer.zero_grad()
+            # Rebuild prompt KV each clip if LLM weights are being updated
+            prompt_kv = model.build_prompt_kv() if llm_is_trainable else prompt_kv_static
+        else:
+            prompt_kv = prompt_kv_static
 
         with torch.set_grad_enabled(is_train):
             with autocast("cuda", enabled=(scaler is not None)):
@@ -539,6 +547,11 @@ def main():
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total_params     = sum(p.numel() for p in model.parameters())
     print(f"Parameters: {trainable_params:,} trainable / {total_params:,} total")
+    # Per-module breakdown to verify freeze settings
+    for name, module in model.named_children():
+        t = sum(p.numel() for p in module.parameters() if p.requires_grad)
+        if t > 0:
+            print(f"  [trainable] {name}: {t:,}")
 
     # ── Optimizer & scheduler ─────────────────────────────────────────────────
     optimizer = build_optimizer(model, cfg)
@@ -630,59 +643,22 @@ def main():
               f"div={train_loss_div:.3f} attn={train_loss_attn:.3f})"
               f" | acc {train_acc:.4f} ===")
 
-        # ── Validation ────────────────────────────────────────────────────────
-        if epoch % cfg.train.eval_interval == 0:
-            model.eval()
-            val_loss    = 0.0
-            val_correct = 0
-            val_total   = 0
-            val_phase_correct = defaultdict(int)
-            val_phase_total   = defaultdict(int)
+        # ── Test evaluation every epoch ───────────────────────────────────────
+        m = evaluate_test(model, cfg, device, epoch)
+        model.train()   # restore train mode after evaluation
 
-            for video_id in cfg.data.val_videos:
-                result = run_video(model, video_id, cfg, device, is_train=False)
-                val_loss    += result["loss"]
-                val_correct += result["correct"]
-                val_total   += result["total"]
-                for ph in range(cfg.data.num_phases):
-                    val_phase_correct[ph] += result["phase_correct"][ph]
-                    val_phase_total[ph]   += result["phase_total"][ph]
-
-            val_acc  = val_correct / max(1, val_total)
-            val_loss = val_loss / len(cfg.data.val_videos)
-            val_phase_accs = {
-                CHOLEC80_PHASES[ph]: val_phase_correct[ph] / max(1, val_phase_total[ph])
-                for ph in range(cfg.data.num_phases)
-            }
-
-            log_dict = {
-                "val/loss":     val_loss,
-                "val/accuracy": val_acc,
-                "epoch":        epoch,
-            }
-            log_dict.update({f"val/acc_{ph}": acc for ph, acc in val_phase_accs.items()})
-            wandb.log(log_dict)
-
-            print(f"=== Epoch {epoch} Val   | loss {val_loss:.4f} | acc {val_acc:.4f} ===\n")
-
-            # Save best checkpoint
-            if val_acc > best_val_acc:
-                best_val_acc = val_acc
-                ckpt_path = os.path.join(cfg.train.save_dir, "best.pt")
-                torch.save({
-                    "epoch":      epoch,
-                    "model":      model.state_dict(),
-                    "optimizer":  optimizer.state_dict(),
-                    "val_acc":    val_acc,
-                    "cfg":        OmegaConf.to_container(cfg),
-                }, ckpt_path)
-                print(f"  Saved best checkpoint → {ckpt_path} (val_acc={val_acc:.4f})")
-
-        # ── Test evaluation (every test_eval_interval epochs) ─────────────────
-        test_interval = cfg.train.get("test_eval_interval", 10)
-        if epoch % test_interval == 0:
-            evaluate_test(model, cfg, device, epoch)
-            model.train()   # restore train mode after evaluation
+        # Save best checkpoint based on test accuracy
+        if m["acc"] > best_val_acc:
+            best_val_acc = m["acc"]
+            ckpt_path = os.path.join(cfg.train.save_dir, "best.pt")
+            torch.save({
+                "epoch":    epoch,
+                "model":    model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "test_acc": m["acc"],
+                "cfg":      OmegaConf.to_container(cfg),
+            }, ckpt_path)
+            print(f"  Saved best checkpoint → {ckpt_path} (test_acc={m['acc']:.4f})")
 
         # Save latest checkpoint every epoch
         torch.save({
