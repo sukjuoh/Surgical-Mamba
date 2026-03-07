@@ -70,6 +70,7 @@ class VideoClipDataset(Dataset):
         tool_dir:    subdirectory name for tool annotations
         seq_len:     frames per clip (T)
         img_size:    spatial size for resizing frames
+        is_train:    if True, apply data augmentation
     """
 
     def __init__(
@@ -80,6 +81,7 @@ class VideoClipDataset(Dataset):
         tool_dir: str = "tool_annotations_1fps",
         seq_len: int = 60,
         img_size: int = 224,
+        is_train: bool = False,
     ):
         self.seq_len = seq_len
         tag = f"video{video_id:02d}"
@@ -108,12 +110,29 @@ class VideoClipDataset(Dataset):
         # Number of clips (last clip may be padded)
         self.num_clips = (self.num_frames + seq_len - 1) // seq_len
 
-        self.transform = transforms.Compose([
-            transforms.Resize((img_size, img_size)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                 std=[0.229, 0.224, 0.225]),
-        ])
+        _norm = transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                     std=[0.229, 0.224, 0.225])
+        if is_train:
+            # Resize slightly larger then random-crop to preserve spatial content
+            # while adding position/scale variety.  Color jitter simulates OR
+            # lighting changes.  Horizontal flip is anatomically valid for
+            # laparoscopic views (mirrored presentation is common).
+            self.transform = transforms.Compose([
+                transforms.Resize((img_size + 32, img_size + 32)),
+                transforms.RandomCrop(img_size),
+                transforms.RandomHorizontalFlip(p=0.5),
+                transforms.ColorJitter(
+                    brightness=0.3, contrast=0.3, saturation=0.2, hue=0.05
+                ),
+                transforms.ToTensor(),
+                _norm,
+            ])
+        else:
+            self.transform = transforms.Compose([
+                transforms.Resize((img_size, img_size)),
+                transforms.ToTensor(),
+                _norm,
+            ])
 
     def __len__(self) -> int:
         return self.num_clips

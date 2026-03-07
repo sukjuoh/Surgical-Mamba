@@ -161,7 +161,9 @@ class SurgicalPhaseLLM(nn.Module):
         num_phases: int = 7,
         vmamba_pretrained: str = None,
         freeze_llm: bool = True,
+        llm_trainable_layers: int = 0,
         freeze_vmamba: bool = False,
+        vmamba_trainable_stages: int = 0,
         mamba_layers: int = 2,
         n_heads: int = 8,
         d_ff: int = 256,
@@ -182,8 +184,17 @@ class SurgicalPhaseLLM(nn.Module):
         self.d_visual = self.extractor.num_features  # 768
 
         if freeze_vmamba:
+            # Freeze entire VMamba backbone first
             for p in self.extractor.parameters():
                 p.requires_grad_(False)
+            # Then selectively unfreeze the last N stages + classifier norm
+            if vmamba_trainable_stages > 0:
+                backbone = self.extractor.backbone
+                for layer in backbone.layers[-vmamba_trainable_stages:]:
+                    for p in layer.parameters():
+                        p.requires_grad_(True)
+                for p in backbone.classifier.parameters():
+                    p.requires_grad_(True)
 
         # ── 2. Mamba temporal refiner ────────────────────────────────────────
         # Refines per-frame features across the temporal dimension before
@@ -205,6 +216,14 @@ class SurgicalPhaseLLM(nn.Module):
         if freeze_llm:
             for p in self.llm.parameters():
                 p.requires_grad_(False)
+            # Selectively unfreeze the last N transformer layers
+            if llm_trainable_layers > 0:
+                for layer in self.llm.model.layers[-llm_trainable_layers:]:
+                    for p in layer.parameters():
+                        p.requires_grad_(True)
+                # Also unfreeze the final norm (feeds directly into classifier)
+                for p in self.llm.model.norm.parameters():
+                    p.requires_grad_(True)
 
         # ── 4. Visual projector: Linear + Reprogram + FFN ───────────────────
         # Direct path
@@ -470,9 +489,11 @@ class SurgicalPhaseLLM(nn.Module):
             llm_model_name   = m.llm_model_name,
             num_phases       = m.num_phases,
             vmamba_pretrained= m.vmamba_pretrained,
-            freeze_llm       = m.freeze_llm,
-            freeze_vmamba    = m.freeze_vmamba,
-            mamba_layers     = m.mamba_layers,
+            freeze_llm              = m.freeze_llm,
+            llm_trainable_layers    = m.get("llm_trainable_layers", 0),
+            freeze_vmamba           = m.freeze_vmamba,
+            vmamba_trainable_stages = m.get("vmamba_trainable_stages", 0),
+            mamba_layers            = m.mamba_layers,
             n_heads          = m.n_heads,
             d_ff             = m.d_ff,
             num_tokens       = m.num_tokens,

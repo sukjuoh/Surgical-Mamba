@@ -325,8 +325,8 @@ def evaluate_test(model: SurgicalPhaseLLM, cfg, device: torch.device, epoch: int
     min_seg_len   = cfg.train.get("test_min_segment",  10)
     num_phases    = cfg.data.num_phases
 
-    all_preds  = []
-    all_labels = []
+    # All metrics computed per-video then averaged (equal weight per video)
+    video_metrics = []
 
     model.eval()
     for video_id in cfg.data.test_videos:
@@ -339,13 +339,15 @@ def evaluate_test(model: SurgicalPhaseLLM, cfg, device: torch.device, epoch: int
         # 2. Short-segment removal
         preds = remove_short_segments(preds, min_len=min_seg_len)
 
-        all_preds.append(preds)
-        all_labels.append(labels)
+        video_metrics.append(compute_cls_metrics(preds, labels, num_phases))
 
-    all_preds  = torch.cat(all_preds,  dim=0)
-    all_labels = torch.cat(all_labels, dim=0)
-
-    m = compute_cls_metrics(all_preds, all_labels, num_phases)
+    # Average each metric across videos
+    m = {
+        "acc":       sum(v["acc"]       for v in video_metrics) / len(video_metrics),
+        "precision": sum(v["precision"] for v in video_metrics) / len(video_metrics),
+        "recall":    sum(v["recall"]    for v in video_metrics) / len(video_metrics),
+        "jaccard":   sum(v["jaccard"]   for v in video_metrics) / len(video_metrics),
+    }
 
     print(
         f"\n{'='*60}\n"
@@ -411,6 +413,7 @@ def run_video(
         tool_dir   = cfg.data.tool_annotation_dir,
         seq_len    = cfg.data.seq_len,
         img_size   = cfg.data.img_size,
+        is_train   = is_train,
     )
     loader = DataLoader(
         dataset,

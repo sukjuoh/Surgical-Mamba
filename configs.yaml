@@ -33,13 +33,15 @@ model:
   local_context_ratio: 4            # temporal downsampling factor (4 → T//4 tokens)
 
   # ── Freeze settings ───────────────────────────────────────────────────────
-  freeze_llm: true                 # keep LLM weights frozen
-  freeze_vmamba: false             # fine-tune VMamba extractor
+  freeze_llm: true                 # freeze LLM (early layers)
+  llm_trainable_layers: 4          # unfreeze last N transformer layers (0=fully frozen)
+  freeze_vmamba: true              # freeze VMamba backbone (early stages)
+  vmamba_trainable_stages: 1       # unfreeze last N stages (0=fully frozen, 1=last stage only)
 
   # ── Regularization ────────────────────────────────────────────────────────
-  attention_dropout: 0.3           # ReprogrammingLayer attention dropout
-  hint_dropout: 0.3                # ClipHintEncoder attention dropout
-  output_dropout: 0.3
+  attention_dropout: 0.1           # ReprogrammingLayer attention dropout
+  hint_dropout: 0.1                # ClipHintEncoder attention dropout
+  output_dropout: 0.1
 
   # ── Prompt-as-Prefix ──────────────────────────────────────────────────────
   # Static knowledge injected to the LLM before the visual tokens.
@@ -113,8 +115,8 @@ train:
 
   num_workers: 0          # 0 = main process only (avoids shm issues in containers)
 
-  epochs: 100
-  warmup_epochs: 20
+  epochs: 50
+  warmup_epochs: 10
 
   use_amp: True            # mixed precision (fp16) — saves ~40% VRAM
 
@@ -127,7 +129,7 @@ train:
   label_smoothing: 0.1   # CE label smoothing (0.1 = soft targets)
   w_smooth:        0.1   # temporal smoothness loss weight (all adjacent pairs)
   w_diversity:     0.1   # hint diversity loss weight
-  w_attn_focus:    1.0   # hint attention focus loss weight
+  w_attn_focus:    0.1   # hint attention focus loss weight
 
   # Learning rate scheduler
   scheduler: "cosine"              # "cosine" | "step" | null
