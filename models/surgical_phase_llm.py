@@ -295,7 +295,18 @@ class SurgicalPhaseLLM(nn.Module):
         self.cross_clip_memory = CrossClipMemory(d_model=self.d_llm)
         self.local_compressor = LocalContextCompressor(ratio=local_context_ratio)
 
-        # ── 8. Output head ───────────────────────────────────────────────────
+        # ── 8. Layer fusion MLP ───────────────────────────────────────────────
+        # Fuses mid-layer + second-to-last layer hidden states.
+        # Mid-layer captures richer semantic features; second-to-last provides
+        # high-level context just before the final generation-tuned layer.
+        self.layer_fusion = nn.Sequential(
+            nn.LayerNorm(d_ff),
+            nn.Linear(d_ff, d_ff * 2),
+            nn.GELU(),
+            nn.Linear(d_ff * 2, d_ff),
+        )
+
+        # ── 9. Output head ───────────────────────────────────────────────────
         self.output_dropout = nn.Dropout(output_dropout)
         self.output_head = nn.Linear(d_ff, num_phases)
 
@@ -472,10 +483,14 @@ class SurgicalPhaseLLM(nn.Module):
             use_cache=False,
             output_hidden_states=True,
         )
-        hidden = lm_out.hidden_states[-1]                             # (B, *, d_llm)
-
         # 7. Extract frame positions and predict ──────────────────────────────
-        frame_hidden = hidden[:, -T:, :self.d_ff].float()             # (B, T, d_ff)
+        # Fuse middle layer + second-to-last layer hidden states.
+        # hidden_states[0] = embedding output, [-1] = final layer.
+        # hidden_states[0]=embedding, hidden_states[-1]=last transformer layer (before LM head)
+        num_hidden = len(lm_out.hidden_states)
+        mid_hidden   = lm_out.hidden_states[num_hidden // 2][:, -T:, :self.d_ff].float()
+        final_hidden = lm_out.hidden_states[-1][:, -T:, :self.d_ff].float()
+        frame_hidden = self.layer_fusion(mid_hidden + final_hidden)    # (B, T, d_ff)
         logits = self.output_head(self.output_dropout(frame_hidden))  # (B, T, num_phases)
 
         return (
