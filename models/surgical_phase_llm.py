@@ -48,7 +48,7 @@ import torch.nn as nn
 from omegaconf import DictConfig
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 
-from .vmamba_extractor import VMambaTinyExtractor
+from .vmamba_extractor import VMambaTinyExtractor, CLIPExtractor
 from .reprogramming import ReprogrammingLayer
 from .clip_hint import ClipHintEncoder
 from .temporal_mamba import TemporalRefiner, CrossClipMemory, LocalContextCompressor
@@ -175,27 +175,37 @@ class SurgicalPhaseLLM(nn.Module):
         attention_dropout: float = 0.1,
         hint_dropout: float = 0.1,
         output_dropout: float = 0.1,
+        visual_backbone: str = "vmamba",       # "vmamba" | "clip"
+        clip_trainable_layers: int = 0,        # clip: unfreeze last N ViT layers (0=fully frozen)
     ):
         super().__init__()
         self.d_ff = d_ff
         self.n_hints = n_hints
 
-        # ── 1. VMamba visual extractor ───────────────────────────────────────
-        self.extractor = VMambaTinyExtractor(pretrained=vmamba_pretrained)
-        self.d_visual = self.extractor.num_features  # 768
-
-        if freeze_vmamba:
-            # Freeze entire VMamba backbone first
-            for p in self.extractor.parameters():
-                p.requires_grad_(False)
-            # Then selectively unfreeze the last N stages + classifier norm
-            if vmamba_trainable_stages > 0:
-                backbone = self.extractor.backbone
-                for layer in backbone.layers[-vmamba_trainable_stages:]:
-                    for p in layer.parameters():
+        # ── 1. Visual extractor (VMamba or CLIP) ─────────────────────────────
+        if visual_backbone == "clip":
+            # CLIPExtractor freezes vision_model internally;
+            # pool_query / pool_attn / proj are always trainable.
+            self.extractor = CLIPExtractor(
+                freeze=freeze_vmamba,
+                trainable_layers=clip_trainable_layers,
+            )
+        else:
+            self.extractor = VMambaTinyExtractor(pretrained=vmamba_pretrained)
+            if freeze_vmamba:
+                # Freeze entire VMamba backbone first
+                for p in self.extractor.parameters():
+                    p.requires_grad_(False)
+                # Then selectively unfreeze the last N stages + classifier norm
+                if vmamba_trainable_stages > 0:
+                    backbone = self.extractor.backbone
+                    for layer in backbone.layers[-vmamba_trainable_stages:]:
+                        for p in layer.parameters():
+                            p.requires_grad_(True)
+                    for p in backbone.classifier.parameters():
                         p.requires_grad_(True)
-                for p in backbone.classifier.parameters():
-                    p.requires_grad_(True)
+
+        self.d_visual = self.extractor.num_features  # 768 for both
 
         # ── 2. Mamba temporal refiner ────────────────────────────────────────
         # Refines per-frame features across the temporal dimension before
@@ -532,4 +542,6 @@ class SurgicalPhaseLLM(nn.Module):
             attention_dropout= m.attention_dropout,
             hint_dropout     = m.hint_dropout,
             output_dropout   = m.output_dropout,
+            visual_backbone       = m.get("visual_backbone", "vmamba"),
+            clip_trainable_layers = m.get("clip_trainable_layers", 0),
         )

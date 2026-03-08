@@ -14,6 +14,14 @@ TemporalRefiner:
   Stack of BidirectionalMambaBlocks. No frame-delta injection — avoids
   augmentation-induced per-frame noise (random crop/flip differ per frame).
   Mamba SSM naturally captures temporal change via selective state updates.
+
+CrossClipMemory write path — Mamba + GRU-style gating:
+  Mamba processes [prev_memory | hints] sequentially (long-range context).
+  A GRU-style update gate then explicitly controls per-slot retention:
+    candidate = Mamba_out[-N:]          (what Mamba proposes)
+    gate = sigmoid(W · [prev_memory, candidate])
+    new_memory = gate * candidate + (1 - gate) * prev_memory
+  This gives Mamba's expressiveness + GRU's explicit "how much to update" control.
 """
 
 import torch
@@ -106,6 +114,11 @@ class CrossClipMemory(nn.Module):
         self.mamba      = Mamba(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)
         self.out_norm   = nn.LayerNorm(d_model)
 
+        # GRU-style update gate: controls per-slot retention vs. update
+        # gate = sigmoid(W · [prev_memory, candidate]) ∈ (0,1)^(B,N,d)
+        self.gate_proj  = nn.Linear(d_model * 2, d_model, bias=True)
+        nn.init.zeros_(self.gate_proj.bias)   # start near 0.5 gate (sigmoid(0)=0.5)
+
     def forward(
         self,
         visual_tokens: torch.Tensor,
@@ -135,6 +148,8 @@ class CrossClipMemory(nn.Module):
             new_memory:      (B, N_hints, d_model) — stored for next clip (write path)
             enriched_memory: (B, N_hints, d_model) or None — LLM global prefix (read path)
         """
+        N = hints.shape[1]
+
         if prev_memory is not None:
             # Read: each memory slot queries current clip → refreshes itself
             enriched_memory, _ = self.cross_attn(
@@ -153,9 +168,19 @@ class CrossClipMemory(nn.Module):
         # Residual SSM
         x = x + self.mamba(self.mamba_norm(x))
 
-        # Last N positions = new memory (for next clip)
-        N = hints.shape[1]
-        new_memory = self.out_norm(x[:, -N:, :])
+        # Mamba candidate for new memory slots
+        candidate = x[:, -N:, :]                                             # (B, N, d)
+
+        if prev_memory is not None:
+            # GRU-style update gate: blend Mamba proposal with prev_memory
+            # gate → 1: take candidate (update); gate → 0: keep prev_memory (retain)
+            gate = torch.sigmoid(
+                self.gate_proj(torch.cat([prev_memory, candidate], dim=-1))  # (B, N, d)
+            )
+            new_memory = self.out_norm(gate * candidate + (1.0 - gate) * prev_memory)
+        else:
+            new_memory = self.out_norm(candidate)
+
         return new_memory, enriched_memory
 
 

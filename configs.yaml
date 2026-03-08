@@ -3,13 +3,14 @@
 # ============================================================
 
 model:
-  llm_model_name: "Qwen/Qwen2.5-0.5B"   # HuggingFace model ID (hidden_size=896)
+  llm_model_name: "HuggingFaceTB/SmolLM2-1.7B"  # HuggingFace model ID (hidden_size=896)
   num_phases: 7                           # CholecT80: 7 surgical phases
-  vmamba_pretrained: "./pretrained/vssmtiny.pth"  # VMamba-Tiny ImageNet pretrained
+  visual_backbone: "clip"                         # "vmamba" | "clip"
+  vmamba_pretrained: "./pretrained/vssmtiny.pth"  # VMamba-Tiny ImageNet pretrained (vmamba only)
 
   # ── Visual projector (Linear + ReprogrammingLayer) ───────────────────────
   n_heads: 8                       # heads for reprogramming cross-attention
-  d_ff: 256                        # output bottleneck (first d_ff dims of LLM hidden states)
+  d_ff: 512                        # output bottleneck (first d_ff dims of LLM hidden states)
   num_tokens: 1000                 # vocabulary reduction for reprogramming K/V (Qwen vocab=151936)
 
   # ── Temporal refiner (Multi-Scale Causal Depthwise Conv) ────────────────────
@@ -36,8 +37,9 @@ model:
   freeze_llm: true                 # freeze LLM (early layers)
   llm_trainable_layers: 0          # unfreeze last N transformer layers (0=fully frozen)
   use_mapping_layer: false         # true=trainable 151M vocab→num_tokens, false=frozen LLM embeddings (TimesLLM style)
-  freeze_vmamba: true              # freeze VMamba backbone (early stages)
-  vmamba_trainable_stages: 1       # unfreeze last N stages (0=fully frozen, 1=last stage only)
+  freeze_vmamba: true              # freeze VMamba backbone / CLIP vision encoder
+  vmamba_trainable_stages: 1       # vmamba only: unfreeze last N stages (0=fully frozen)
+  clip_trainable_layers: 0         # clip only: unfreeze last N ViT layers (0=fully frozen, ViT-L/14 has 24 total)
 
   # ── Regularization ────────────────────────────────────────────────────────
   attention_dropout: 0.1           # ReprogrammingLayer attention dropout
@@ -130,7 +132,7 @@ train:
   label_smoothing: 0.1   # CE label smoothing (0.1 = soft targets)
   w_smooth:        0.1   # temporal smoothness loss weight (all adjacent pairs)
   w_diversity:     0.1   # hint diversity loss weight
-  w_attn_focus:    0.1   # hint attention focus loss weight
+  w_attn_focus:    0.0   # hint attention focus loss weight
 
   # Learning rate scheduler
   scheduler: "cosine"              # "cosine" | "step" | null
