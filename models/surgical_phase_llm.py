@@ -305,10 +305,16 @@ class SurgicalPhaseLLM(nn.Module):
         self.cross_clip_memory = CrossClipMemory(d_model=self.d_llm)
         self.local_compressor = LocalContextCompressor(ratio=local_context_ratio)
 
-        # ── 8. Layer fusion MLP ───────────────────────────────────────────────
-        # Fuses mid-layer + second-to-last layer hidden states.
-        # Mid-layer captures richer semantic features; second-to-last provides
-        # high-level context just before the final generation-tuned layer.
+        # ── 8. Layer fusion: gated mid + final LLM hidden states ─────────────
+        # Content-aware gate controls per-frame per-dim blend of mid vs final.
+        #   gate = sigmoid(W · [mid, final])  ∈ (0,1)^(B,T,d_ff)
+        #   fused = gate * mid + (1-gate) * final
+        # Bias init to 0 → sigmoid(0)=0.5, starts from balanced mix.
+        # At phase transitions mid features (structural) may dominate;
+        # within stable phases final features (semantic) may dominate.
+        self.llm_gate_proj = nn.Linear(d_ff * 2, d_ff, bias=True)
+        nn.init.zeros_(self.llm_gate_proj.bias)
+
         self.layer_fusion = nn.Sequential(
             nn.LayerNorm(d_ff),
             nn.Linear(d_ff, d_ff * 2),
@@ -500,7 +506,13 @@ class SurgicalPhaseLLM(nn.Module):
         num_hidden = len(lm_out.hidden_states)
         mid_hidden   = lm_out.hidden_states[num_hidden // 2][:, -T:, :self.d_ff].float()
         final_hidden = lm_out.hidden_states[-1][:, -T:, :self.d_ff].float()
-        frame_hidden = self.layer_fusion(mid_hidden + final_hidden)    # (B, T, d_ff)
+
+        # Content-aware gate: per-frame per-dim blend of mid vs final
+        gate = torch.sigmoid(
+            self.llm_gate_proj(torch.cat([mid_hidden, final_hidden], dim=-1))
+        )                                                               # (B, T, d_ff)
+        fused = gate * mid_hidden + (1.0 - gate) * final_hidden        # (B, T, d_ff)
+        frame_hidden = self.layer_fusion(fused)                        # (B, T, d_ff)
         logits = self.output_head(self.output_dropout(frame_hidden))  # (B, T, num_phases)
 
         return (

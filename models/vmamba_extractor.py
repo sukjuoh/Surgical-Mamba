@@ -76,29 +76,37 @@ class CLIPExtractor(nn.Module):
     Patch grid: (224 / 14)^2 = 256 patch tokens per frame.
 
     Pipeline per frame:
-      CLIP vision encoder → last_hidden_state (B, 257, 1024)   [CLS + 256 patches]
-      skip CLS → patch tokens (B, 256, 1024)
-      attention pooling (1 learnable query) → (B, 1024)
+      CLIP vision encoder → hidden_states at mid + final layers
+      Mid  layer (depth//2): fine-grained spatial/texture features
+      Final layer (depth-1): high-level semantic features
+
+      Each layer: skip CLS → patch tokens (B, 256, 1024)
+                  → separate attention pooling (learnable query) → (B, 1024)
+      Fuse: LayerNorm(mid_pooled + final_pooled)  → (B, 1024)
       Linear(1024 → 768) → (B, 768)
 
-    The attention pooling query learns to focus on surgical-relevant spatial regions
-    (tool locations, tissue texture) rather than blindly averaging all patches.
+    Two independent pool_query/pool_attn heads allow mid and final layers to be
+    aggregated with different spatial attention patterns — the mid-layer head can
+    focus on fine-grained tool regions while the final-layer head captures
+    semantic phase-level context.
 
     Args:
-        freeze:           freeze CLIP vision encoder (pool_query/pool_attn/proj always trainable)
+        freeze:           freeze CLIP vision encoder (pooling heads + proj always trainable)
         trainable_layers: unfreeze last N ViT-L/14 transformer layers + final LayerNorm
                           (0 = fully frozen, ViT-L/14 has 24 layers total)
-        n_heads:          number of heads in attention pooling
+        n_heads:          number of heads in each attention pooling head
     """
 
-    _CLIP_DIM = 1024     # ViT-L/14 internal hidden dim
-    _OUT_DIM  = 768      # target output dim (matches VMamba-Tiny)
+    _CLIP_DIM  = 1024    # ViT-L/14 internal hidden dim
+    _OUT_DIM   = 768     # target output dim (matches VMamba-Tiny)
+    _NUM_LAYERS = 24     # ViT-L/14 transformer depth
 
     def __init__(self, freeze: bool = True, trainable_layers: int = 0, n_heads: int = 8):
         super().__init__()
         from transformers import CLIPVisionModel
         self.vision_model = CLIPVisionModel.from_pretrained("openai/clip-vit-large-patch14")
         self.num_features = self._OUT_DIM
+        self._mid_layer   = self._NUM_LAYERS // 2  # layer 12
 
         if freeze:
             for p in self.vision_model.parameters():
@@ -113,14 +121,17 @@ class CLIPExtractor(nn.Module):
                 for p in self.vision_model.vision_model.post_layernorm.parameters():
                     p.requires_grad_(True)
 
-        # Attention pooling: 1 learnable query compresses 256 patch tokens → 1 vector
-        self.pool_query = nn.Parameter(torch.randn(1, 1, self._CLIP_DIM) * 0.02)
-        self.pool_attn  = nn.MultiheadAttention(
-            self._CLIP_DIM, n_heads, batch_first=True
-        )
-        self.pool_norm  = nn.LayerNorm(self._CLIP_DIM)
+        # Mid-layer attention pooling: focuses on fine-grained spatial features
+        self.pool_query_mid   = nn.Parameter(torch.randn(1, 1, self._CLIP_DIM) * 0.02)
+        self.pool_attn_mid    = nn.MultiheadAttention(self._CLIP_DIM, n_heads, batch_first=True)
 
-        # Project CLIP dim → VMamba-compatible dim
+        # Final-layer attention pooling: focuses on high-level semantic features
+        self.pool_query_final = nn.Parameter(torch.randn(1, 1, self._CLIP_DIM) * 0.02)
+        self.pool_attn_final  = nn.MultiheadAttention(self._CLIP_DIM, n_heads, batch_first=True)
+
+        self.fuse_norm = nn.LayerNorm(self._CLIP_DIM)
+
+        # Project fused CLIP dim → VMamba-compatible dim
         self.proj = nn.Linear(self._CLIP_DIM, self._OUT_DIM)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -128,18 +139,31 @@ class CLIPExtractor(nn.Module):
         Args:
             x: (B, 3, H, W)   — H=W=224 expected
         Returns:
-            (B, 768)           — spatially-pooled per-frame feature
+            (B, 768)           — mid+final fused spatially-pooled per-frame feature
         """
-        out = self.vision_model(pixel_values=x)
-        # last_hidden_state: (B, 257, 1024) → skip CLS token at index 0
-        patch_tokens = out.last_hidden_state[:, 1:, :]     # (B, 256, 1024)
+        out = self.vision_model(pixel_values=x, output_hidden_states=True)
 
-        B = patch_tokens.shape[0]
-        q = self.pool_query.expand(B, -1, -1)              # (B, 1, 1024)
-        pooled, _ = self.pool_attn(q, patch_tokens, patch_tokens)  # (B, 1, 1024)
-        pooled = self.pool_norm(pooled.squeeze(1))         # (B, 1024)
+        # hidden_states[0] = patch embeddings, [1..24] = transformer layer outputs
+        # mid layer index in hidden_states = _mid_layer + 1 (offset by embedding layer)
+        mid_patches   = out.hidden_states[self._mid_layer + 1][:, 1:, :]  # (B, 256, 1024)
+        final_patches = out.last_hidden_state[:, 1:, :]                    # (B, 256, 1024)
 
-        return self.proj(pooled)                           # (B, 768)
+        B = x.shape[0]
+
+        # Mid-layer pooling: learns fine-grained spatial aggregation
+        q_mid = self.pool_query_mid.expand(B, -1, -1)
+        pooled_mid, _   = self.pool_attn_mid(q_mid, mid_patches, mid_patches)
+        pooled_mid = pooled_mid.squeeze(1)                                 # (B, 1024)
+
+        # Final-layer pooling: learns semantic aggregation
+        q_fin = self.pool_query_final.expand(B, -1, -1)
+        pooled_final, _ = self.pool_attn_final(q_fin, final_patches, final_patches)
+        pooled_final = pooled_final.squeeze(1)                             # (B, 1024)
+
+        # Fuse: residual sum + LayerNorm
+        fused = self.fuse_norm(pooled_mid + pooled_final)                  # (B, 1024)
+
+        return self.proj(fused)                                            # (B, 768)
 
 
 class VMambaTinyM2Extractor(_BaseExtractor):
