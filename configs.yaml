@@ -41,19 +41,19 @@ model:
   vmamba_trainable_stages: 1       # vmamba only: unfreeze last N stages (0=fully frozen)
   clip_trainable_layers: 0         # clip only: unfreeze last N ViT layers (0=fully frozen, ViT-L/14 has 24 total)
 
-  # ── QLoRA fine-tuning (requires: pip install bitsandbytes peft) ───────────
-  # When use_qlora=true: LLM is loaded in 4-bit NF4 + LoRA adapters applied.
-  # KV caching is automatically disabled (LoRA updates K/V projections each step).
-  # Set freeze_llm=false when using QLoRA (LoRA params are trained instead).
-  use_qlora: true
-  qlora_r: 8                       # LoRA rank (higher = more capacity, more VRAM)
-  qlora_alpha: 16                  # LoRA scaling factor (effective lr = alpha/r)
-  qlora_dropout: 0.05
-  # ["q_proj","v_proj"]       — original LoRA paper recommendation (fewer params, often enough)
+  # ── LoRA fine-tuning (requires: pip install peft) ────────────────────────
+  # Plain LoRA (no quantization): appropriate for small LLMs (≤1B).
+  # Base model stays in FP16; only LoRA adapter weights are trained.
+  # KV caching is automatically disabled when use_lora=true.
+  # Set freeze_llm=false when using LoRA (LoRA params are trained instead).
+  use_lora: false
+  lora_r: 8                        # LoRA rank (higher = more capacity, more VRAM)
+  lora_alpha: 16                   # LoRA scaling factor (effective lr = alpha/r)
+  lora_dropout: 0.05
+  # ["q_proj","v_proj"]         — original LoRA paper recommendation
   # ["q_proj","k_proj","v_proj"] — add keys for stronger adaptation
-  # ["q_proj","k_proj","v_proj","o_proj"] — all attention projections (most expressive)
-  # null → auto-detect ["q_proj","v_proj"] for Llama/Qwen/SmolLM2
-  qlora_target_modules: ["q_proj","v_proj"]
+  # null → default ["q_proj","v_proj"]
+  lora_target_modules: null
 
   # ── Regularization ────────────────────────────────────────────────────────
   attention_dropout: 0.1           # ReprogrammingLayer attention dropout

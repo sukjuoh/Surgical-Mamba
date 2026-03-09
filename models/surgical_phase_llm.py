@@ -295,17 +295,17 @@ class SurgicalPhaseLLM(nn.Module):
         output_dropout: float = 0.1,
         visual_backbone: str = "vmamba",       # "vmamba" | "clip"
         clip_trainable_layers: int = 0,        # clip: unfreeze last N ViT layers (0=fully frozen)
-        # ── QLoRA fine-tuning ────────────────────────────────────────────────
-        use_qlora: bool = False,               # enable 4-bit QLoRA for LLM fine-tuning
-        qlora_r: int = 8,                      # LoRA rank
-        qlora_alpha: int = 16,                 # LoRA alpha (scaling = alpha/r)
-        qlora_dropout: float = 0.05,
-        qlora_target_modules: list = None,     # None → auto-detect q/k/v/o projections
+        # ── LoRA fine-tuning ─────────────────────────────────────────────────
+        use_lora: bool = False,                # enable LoRA adapters for LLM fine-tuning
+        lora_r: int = 8,                       # LoRA rank
+        lora_alpha: int = 16,                  # LoRA alpha (scaling = alpha/r)
+        lora_dropout: float = 0.05,
+        lora_target_modules: list = None,      # None → ["q_proj","v_proj"]
     ):
         super().__init__()
         self.d_ff = d_ff
         self.n_hints = n_hints
-        self._use_qlora = use_qlora
+        self._use_lora = use_lora
 
         # ── 1. Visual extractor (VMamba or CLIP) ─────────────────────────────
         if visual_backbone == "clip":
@@ -346,51 +346,37 @@ class SurgicalPhaseLLM(nn.Module):
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        if use_qlora:
-            # ── QLoRA path: 4-bit quantised base + LoRA adapters ─────────────
-            # KV caching is disabled during QLoRA fine-tuning because the LoRA
-            # adapters modify the K/V projections; cached KVs from previous steps
-            # would be stale after every parameter update.
-            from transformers import BitsAndBytesConfig
-            from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+        self.llm = AutoModelForCausalLM.from_pretrained(llm_model_name)
 
-            bnb_config = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_compute_dtype=torch.bfloat16,
-                bnb_4bit_use_double_quant=True,
-            )
-            self.llm = AutoModelForCausalLM.from_pretrained(
-                llm_model_name,
-                quantization_config=bnb_config,
-                device_map="auto",
-            )
-            self.llm = prepare_model_for_kbit_training(self.llm)
+        if use_lora:
+            # ── LoRA path: FP16 base + LoRA adapters ─────────────────────────
+            # For small models (≤1B) quantization gives negligible memory savings
+            # but adds bitsandbytes complexity. Plain LoRA is simpler and equally
+            # effective: base weights stay frozen, only adapters are trained.
+            # KV caching is disabled because LoRA updates Q/V projections every
+            # step, making cached KVs stale after each optimizer update.
+            from peft import LoraConfig, get_peft_model
 
-            if qlora_target_modules is None:
+            if lora_target_modules is None:
                 # Q+V only: original LoRA paper recommendation.
-                # Q controls what visual patterns to attend to;
-                # V controls what information gets extracted — both critical for
-                # learning to interpret visual tokens in the LLM's embedding space.
-                # Add "k_proj" or "o_proj" in configs if stronger adaptation is needed.
-                qlora_target_modules = ["q_proj", "v_proj"]
+                # Q — what to attend to; V — what information to extract.
+                # Both are critical for learning to interpret visual tokens.
+                lora_target_modules = ["q_proj", "v_proj"]
 
             lora_cfg = LoraConfig(
-                r=qlora_r,
-                lora_alpha=qlora_alpha,
-                lora_dropout=qlora_dropout,
-                target_modules=qlora_target_modules,
+                r=lora_r,
+                lora_alpha=lora_alpha,
+                lora_dropout=lora_dropout,
+                target_modules=lora_target_modules,
                 bias="none",
                 task_type="CAUSAL_LM",
             )
             self.llm = get_peft_model(self.llm, lora_cfg)
             self.llm.print_trainable_parameters()
-            # Prompt KV cache is disabled — forward_clip prepends prompt_emb directly
+            # Prompt KV cache disabled — forward_clip prepends prompt_emb directly
             self._prompt_kv = None
         else:
             # ── Normal path: frozen LLM (default) ────────────────────────────
-            self.llm = AutoModelForCausalLM.from_pretrained(llm_model_name)
-
             if freeze_llm:
                 for p in self.llm.parameters():
                     p.requires_grad_(False)
@@ -510,22 +496,6 @@ class SurgicalPhaseLLM(nn.Module):
         self.output_dropout = nn.Dropout(output_dropout)
         self.output_head = nn.Linear(d_ff, num_phases)
 
-    def to(self, *args, **kwargs):
-        """Override to avoid moving quantised LLM when QLoRA is active."""
-        if self._use_qlora:
-            # 4-bit quantised layers are pinned to their CUDA device by bitsandbytes.
-            # Move every other module normally; leave self.llm untouched.
-            for name, child in self.named_children():
-                if name != "llm":
-                    child.to(*args, **kwargs)
-            # Keep buffers (prompt_emb, etc.) on the same device as non-LLM modules
-            for buf_name, buf in self.named_buffers():
-                if not buf_name.startswith("llm."):
-                    setattr(self, buf_name.split(".")[-1],
-                            buf.to(*args, **kwargs))
-            return self
-        return super().to(*args, **kwargs)
-
     # ── Prompt KV cache ──────────────────────────────────────────────────────
 
     @torch.no_grad()
@@ -535,11 +505,11 @@ class SurgicalPhaseLLM(nn.Module):
         Stored as legacy tuple format so each forward_clip builds a fresh
         DynamicCache — prevents in-place mutation across clips.
 
-        Returns None when QLoRA is active: prompt is prepended directly
+        Returns None when LoRA is active: prompt is prepended directly
         each forward pass to avoid stale cached KVs after LoRA updates.
         """
-        if self._use_qlora:
-            # QLoRA: LoRA adapters change K/V projections during training →
+        if self._use_lora:
+            # LoRA adapters change Q/V projections during training →
             # a cached KV from before an optimizer step would be wrong.
             # forward_clip prepends prompt_emb directly instead.
             self._prompt_kv = None
@@ -784,9 +754,9 @@ class SurgicalPhaseLLM(nn.Module):
             output_dropout   = m.output_dropout,
             visual_backbone       = m.get("visual_backbone", "vmamba"),
             clip_trainable_layers = m.get("clip_trainable_layers", 0),
-            use_qlora             = m.get("use_qlora", False),
-            qlora_r               = m.get("qlora_r", 8),
-            qlora_alpha           = m.get("qlora_alpha", 16),
-            qlora_dropout         = m.get("qlora_dropout", 0.05),
-            qlora_target_modules  = m.get("qlora_target_modules", None),
+            use_lora              = m.get("use_lora", False),
+            lora_r                = m.get("lora_r", 8),
+            lora_alpha            = m.get("lora_alpha", 16),
+            lora_dropout          = m.get("lora_dropout", 0.05),
+            lora_target_modules   = m.get("lora_target_modules", None),
         )
