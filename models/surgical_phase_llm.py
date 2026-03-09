@@ -75,6 +75,9 @@ CHOLEC80_TOOLS = [
     "SpecimenBag",
 ]
 
+# ── Prompt prefix (static, KV-cached) ────────────────────────────────────────
+# Describes dataset context, phase semantics, and tool semantics.
+# Does NOT describe input structure — section headers below do that inline.
 _DEFAULT_PROMPT = (
     "<|start_prompt|>"
     "Dataset description: Laparoscopic cholecystectomy surgical video recorded at 1 fps. "
@@ -104,26 +107,141 @@ _DEFAULT_PROMPT = (
     "Phase 4 - GallbladderPackaging: Grasper, SpecimenBag. "
     "Phase 5 - CleaningCoagulation: Grasper, Bipolar, Irrigator. "
     "Phase 6 - GallbladderRetraction: Grasper, SpecimenBag. "
-    "Input sequence structure per clip: "
-    "[Global memory tokens] A fixed number of tokens summarising all previously seen clips "
-    "via a Mamba SSM updated with cross-attention to the current clip, providing long-range "
-    "surgical context across the entire video. "
-    "[Local hint tokens] Clip-level visual summary tokens follow the global memory. "
-    "Each local hint token is a learned compression of the current clip visual features, "
-    "capturing dominant scene content, temporal dynamics, and phase transition signals. "
-    "[Tool context] A text description of which surgical tools are active in each temporal "
-    "segment of the current clip follows the local hint tokens. "
-    "[Previous clip context] A temporally compressed representation of the immediately "
-    "preceding clip's visual tokens follows the tool context, providing dense local "
-    "continuity between consecutive clips. "
-    "[Visual tokens] Per-frame visual feature tokens follow the previous clip context. "
-    "Each visual token encodes one second of video as a 768-dimensional feature "
-    "vector extracted by a VMamba-Tiny backbone and refined by a Mamba temporal encoder. "
     "<|end_prompt|>"
 )
 
+# ── Section headers (static, pre-embedded as buffers) ────────────────────────
+# Each header is placed immediately before its corresponding token group,
+# so the LLM sees "what these tokens are" right at the point they appear.
+_SEG_MEMORY = "The following tokens summarise the global surgical context from all previous clips:"
+_SEG_HINTS  = "The following tokens are visual summary tokens for the current clip:"
+_SEG_PREV   = "The following tokens are a compressed representation of the previous clip:"
+_SEG_VISUAL = "The following tokens are per-frame visual feature tokens for the current clip:"
+
 # Number of temporal segments for per-segment tool text
 _N_TOOL_SEGMENTS = 4
+
+# ── Surgical/medical domain vocabulary for reprogramming token selection ──────
+# Used to select semantically relevant LLM tokens as K/V bank for the
+# ReprogrammingLayer, replacing the naive "first num_tokens tokens" approach.
+_SURGICAL_SEED_WORDS = [
+    # Phase names (full + decomposed)
+    "Preparation", "preparation", "prepare", "prepared", "preparing",
+    "Dissection", "dissection", "dissect", "dissecting",
+    "Clipping", "clipping", "clip", "clips",
+    "Cutting", "cutting", "cut", "cutter",
+    "Gallbladder", "gallbladder", "gall", "bladder",
+    "Packaging", "packaging", "package",
+    "Retraction", "retraction", "retract", "retracting",
+    "Coagulation", "coagulation", "coagulate", "coagulating",
+    "Cleaning", "cleaning", "clean",
+    "Irrigation", "irrigation", "irrigate", "irrigating",
+    "Calot", "calot", "triangle",
+    # Anatomy
+    "peritoneum", "cystic", "duct", "artery",
+    "liver", "bile", "abdomen", "abdominal", "hepatic",
+    "hepatocystic", "cholecyst", "cholecystectomy",
+    "trocar", "laparoscopic", "laparoscopy", "endoscopic",
+    # Tools
+    "Grasper", "grasper", "grasp", "grasping",
+    "Bipolar", "bipolar",
+    "Hook", "hook",
+    "Scissors", "scissors", "scissor",
+    "Clipper", "clipper",
+    "Irrigator", "irrigator",
+    "SpecimenBag", "specimen", "bag",
+    # Surgical actions
+    "insert", "remove", "place", "apply",
+    "cut", "suture", "staple", "stitch",
+    "irrigate", "aspirate", "coagulate",
+    "dissect", "expose", "identify", "separate", "mobilize",
+    "grasp", "retract", "lift", "pull", "push",
+    "visualize", "inspect", "examine",
+    # Medical/surgical context
+    "surgical", "surgery", "operation", "procedure", "operative", "intraoperative",
+    "tissue", "vessel", "hemorrhage", "bleeding", "hemostasis",
+    "incision", "visualization", "exposure", "identification",
+    "instrument", "device", "tool",
+    "phase", "stage", "step", "transition",
+    "visible", "identified", "completed", "ongoing", "initiated",
+    "patient", "anatomy", "blood", "fat", "adipose",
+    "camera", "endoscope", "laparoscope", "scope", "port",
+    "frame", "video", "recognition", "detection",
+]
+
+
+def _select_domain_token_ids(tokenizer, vocab_size: int, num_tokens: int) -> torch.Tensor:
+    """
+    Build a set of token IDs biased toward surgical/medical domain concepts.
+
+    Strategy:
+      1. Tokenize each word in _SURGICAL_SEED_WORDS (with/without leading space).
+      2. Collect all unique token IDs that appear in those tokenizations.
+      3. If fewer than num_tokens, pad with sequential IDs not yet included.
+
+    Returns:
+        LongTensor of shape (num_tokens,)
+    """
+    seen: set = set()
+    ordered: list = []
+
+    for word in _SURGICAL_SEED_WORDS:
+        for variant in [word, " " + word, word.lower(), " " + word.lower()]:
+            ids = tokenizer(variant, add_special_tokens=False).input_ids
+            for tid in ids:
+                if 0 <= tid < vocab_size and tid not in seen:
+                    seen.add(tid)
+                    ordered.append(tid)
+                    if len(ordered) >= num_tokens:
+                        break
+            if len(ordered) >= num_tokens:
+                break
+        if len(ordered) >= num_tokens:
+            break
+
+    # Pad with sequential tokens if surgical vocab didn't fill num_tokens
+    if len(ordered) < num_tokens:
+        for tid in range(vocab_size):
+            if tid not in seen:
+                ordered.append(tid)
+                seen.add(tid)
+            if len(ordered) >= num_tokens:
+                break
+
+    return torch.tensor(ordered[:num_tokens], dtype=torch.long)
+
+
+def _build_hint_init_embeddings(
+    embed_fn, tokenizer, n_hints: int, d_llm: int
+) -> torch.Tensor:
+    """
+    Initialize hint queries from LLM embeddings of phase/tool concept names.
+
+    Each phase and tool name is tokenized and its token embeddings are mean-pooled
+    to a single d_llm vector. Vectors are tiled to fill n_hints slots.
+
+    Returns:
+        FloatTensor of shape (n_hints, d_llm)
+    """
+    concepts = CHOLEC80_PHASES + CHOLEC80_TOOLS  # 14 concepts
+
+    emb_list = []
+    for concept in concepts:
+        ids = tokenizer(concept, add_special_tokens=False, return_tensors="pt").input_ids
+        with torch.no_grad():
+            tok_embs = embed_fn(ids)            # (1, L, d_llm)
+        emb_list.append(tok_embs.mean(dim=1).squeeze(0))  # (d_llm,)
+
+    embs = torch.stack(emb_list, dim=0).float()            # (14, d_llm)
+
+    # Tile to fill n_hints
+    if embs.shape[0] < n_hints:
+        repeats = (n_hints + embs.shape[0] - 1) // embs.shape[0]
+        embs = embs.repeat(repeats, 1)[:n_hints]
+    else:
+        embs = embs[:n_hints]
+
+    return embs  # (n_hints, d_llm)
 
 
 class SurgicalPhaseLLM(nn.Module):
@@ -177,10 +295,17 @@ class SurgicalPhaseLLM(nn.Module):
         output_dropout: float = 0.1,
         visual_backbone: str = "vmamba",       # "vmamba" | "clip"
         clip_trainable_layers: int = 0,        # clip: unfreeze last N ViT layers (0=fully frozen)
+        # ── QLoRA fine-tuning ────────────────────────────────────────────────
+        use_qlora: bool = False,               # enable 4-bit QLoRA for LLM fine-tuning
+        qlora_r: int = 8,                      # LoRA rank
+        qlora_alpha: int = 16,                 # LoRA alpha (scaling = alpha/r)
+        qlora_dropout: float = 0.05,
+        qlora_target_modules: list = None,     # None → auto-detect q/k/v/o projections
     ):
         super().__init__()
         self.d_ff = d_ff
         self.n_hints = n_hints
+        self._use_qlora = use_qlora
 
         # ── 1. Visual extractor (VMamba or CLIP) ─────────────────────────────
         if visual_backbone == "clip":
@@ -216,25 +341,69 @@ class SurgicalPhaseLLM(nn.Module):
             num_layers=mamba_layers,
         )
 
-        # ── 3. LLM (frozen by default) ───────────────────────────────────────
-        self.llm = AutoModelForCausalLM.from_pretrained(llm_model_name)
+        # ── 3. LLM ───────────────────────────────────────────────────────────
         self.tokenizer = AutoTokenizer.from_pretrained(llm_model_name)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        self.d_llm = self.llm.config.hidden_size
+        if use_qlora:
+            # ── QLoRA path: 4-bit quantised base + LoRA adapters ─────────────
+            # KV caching is disabled during QLoRA fine-tuning because the LoRA
+            # adapters modify the K/V projections; cached KVs from previous steps
+            # would be stale after every parameter update.
+            from transformers import BitsAndBytesConfig
+            from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 
-        if freeze_llm:
-            for p in self.llm.parameters():
-                p.requires_grad_(False)
-            # Selectively unfreeze the last N transformer layers
-            if llm_trainable_layers > 0:
-                for layer in self.llm.model.layers[-llm_trainable_layers:]:
-                    for p in layer.parameters():
+            bnb_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_use_double_quant=True,
+            )
+            self.llm = AutoModelForCausalLM.from_pretrained(
+                llm_model_name,
+                quantization_config=bnb_config,
+                device_map="auto",
+            )
+            self.llm = prepare_model_for_kbit_training(self.llm)
+
+            if qlora_target_modules is None:
+                # Q+V only: original LoRA paper recommendation.
+                # Q controls what visual patterns to attend to;
+                # V controls what information gets extracted — both critical for
+                # learning to interpret visual tokens in the LLM's embedding space.
+                # Add "k_proj" or "o_proj" in configs if stronger adaptation is needed.
+                qlora_target_modules = ["q_proj", "v_proj"]
+
+            lora_cfg = LoraConfig(
+                r=qlora_r,
+                lora_alpha=qlora_alpha,
+                lora_dropout=qlora_dropout,
+                target_modules=qlora_target_modules,
+                bias="none",
+                task_type="CAUSAL_LM",
+            )
+            self.llm = get_peft_model(self.llm, lora_cfg)
+            self.llm.print_trainable_parameters()
+            # Prompt KV cache is disabled — forward_clip prepends prompt_emb directly
+            self._prompt_kv = None
+        else:
+            # ── Normal path: frozen LLM (default) ────────────────────────────
+            self.llm = AutoModelForCausalLM.from_pretrained(llm_model_name)
+
+            if freeze_llm:
+                for p in self.llm.parameters():
+                    p.requires_grad_(False)
+                # Selectively unfreeze the last N transformer layers
+                if llm_trainable_layers > 0:
+                    for layer in self.llm.model.layers[-llm_trainable_layers:]:
+                        for p in layer.parameters():
+                            p.requires_grad_(True)
+                    # Also unfreeze the final norm (feeds directly into classifier)
+                    for p in self.llm.model.norm.parameters():
                         p.requires_grad_(True)
-                # Also unfreeze the final norm (feeds directly into classifier)
-                for p in self.llm.model.norm.parameters():
-                    p.requires_grad_(True)
+
+        self.d_llm = self.llm.config.hidden_size
 
         # ── 4. Visual projector: Linear + Reprogram + FFN ───────────────────
         # Direct path
@@ -244,14 +413,25 @@ class SurgicalPhaseLLM(nn.Module):
         word_emb_weight = self.llm.get_input_embeddings().weight  # (V, d_llm)
         self.vocab_size = word_emb_weight.shape[0]
         self.use_mapping_layer = use_mapping_layer
+
+        # Build domain-biased token index (surgical/medical vocab → token IDs)
+        domain_ids = _select_domain_token_ids(self.tokenizer, self.vocab_size, num_tokens)
+        # domain_ids: (num_tokens,) LongTensor of surgical-domain token IDs
+
         if use_mapping_layer:
-            # Learnable: 151M-param matrix selects num_tokens from full vocab
+            # Learnable: full vocab → num_tokens weighted combination.
+            # Initialise the mapping so domain tokens receive high initial weight.
             self.mapping_layer = nn.Linear(self.vocab_size, num_tokens)
+            with torch.no_grad():
+                self.mapping_layer.weight.zero_()
+                self.mapping_layer.weight[
+                    torch.arange(num_tokens), domain_ids
+                ] = 1.0  # start as a hard domain-token selection, soften during training
         else:
-            # Frozen: directly use first num_tokens LLM embeddings as K/V
+            # Frozen: use domain-relevant token embeddings directly as K/V
             self.register_buffer(
                 "src_word_embeddings",
-                word_emb_weight[:num_tokens].detach().float()
+                word_emb_weight[domain_ids].detach().float()
             )
         self.reprogramming = ReprogrammingLayer(
             d_model=self.d_visual,
@@ -271,6 +451,11 @@ class SurgicalPhaseLLM(nn.Module):
         self.visual_norm2 = nn.LayerNorm(self.d_llm)
 
         # ── 5. Clip hint encoder ─────────────────────────────────────────────
+        # Initialize hint queries from LLM embeddings of phase/tool names so
+        # each query starts "looking for" a specific surgical concept rather
+        # than a random direction in embedding space.
+        embed_fn = self.llm.get_input_embeddings()
+        hint_init = _build_hint_init_embeddings(embed_fn, self.tokenizer, n_hints, self.d_llm)
         self.hint_encoder = ClipHintEncoder(
             n_hints=n_hints,
             d_visual=self.d_visual,
@@ -278,20 +463,35 @@ class SurgicalPhaseLLM(nn.Module):
             n_heads=n_heads,
             dropout=hint_dropout,
             max_seq=512,
+            init_embeddings=hint_init,
         )
 
-        # ── 6. Prompt KV cache setup ─────────────────────────────────────────
+        # ── 6. Prompt KV cache setup + section header embeddings ─────────────
         self.prompt_text = prompt
         prompt_ids = self.tokenizer(
             prompt, return_tensors="pt", truncation=True, max_length=2048
         ).input_ids
 
+        embed_fn = self.llm.get_input_embeddings()
         with torch.no_grad():
-            prompt_emb = self.llm.get_input_embeddings()(prompt_ids)  # (1, P, d_llm)
+            prompt_emb = embed_fn(prompt_ids)                          # (1, P, d_llm)
 
         self.register_buffer("prompt_emb", prompt_emb.detach())
         self.prompt_len = prompt_emb.shape[1]
         self._prompt_kv: tuple = None
+
+        # Pre-embed section headers — placed inline just before each token group
+        # so the LLM immediately knows what the following tokens represent.
+        for attr, text in [
+            ("seg_memory_emb", _SEG_MEMORY),
+            ("seg_hints_emb",  _SEG_HINTS),
+            ("seg_prev_emb",   _SEG_PREV),
+            ("seg_visual_emb", _SEG_VISUAL),
+        ]:
+            ids = self.tokenizer(text, return_tensors="pt").input_ids
+            with torch.no_grad():
+                emb = embed_fn(ids)                                    # (1, L, d_llm)
+            self.register_buffer(attr, emb.detach())
 
         # ── 7. Cross-clip memory (SSM-based) + local context compressor ──────
         # CrossClipMemory has two separate paths:
@@ -305,26 +505,26 @@ class SurgicalPhaseLLM(nn.Module):
         self.cross_clip_memory = CrossClipMemory(d_model=self.d_llm)
         self.local_compressor = LocalContextCompressor(ratio=local_context_ratio)
 
-        # ── 8. Layer fusion: gated mid + final LLM hidden states ─────────────
-        # Content-aware gate controls per-frame per-dim blend of mid vs final.
-        #   gate = sigmoid(W · [mid, final])  ∈ (0,1)^(B,T,d_ff)
-        #   fused = gate * mid + (1-gate) * final
-        # Bias init to 0 → sigmoid(0)=0.5, starts from balanced mix.
-        # At phase transitions mid features (structural) may dominate;
-        # within stable phases final features (semantic) may dominate.
-        self.llm_gate_proj = nn.Linear(d_ff * 2, d_ff, bias=True)
-        nn.init.zeros_(self.llm_gate_proj.bias)
 
-        self.layer_fusion = nn.Sequential(
-            nn.LayerNorm(d_ff),
-            nn.Linear(d_ff, d_ff * 2),
-            nn.GELU(),
-            nn.Linear(d_ff * 2, d_ff),
-        )
-
-        # ── 9. Output head ───────────────────────────────────────────────────
+        # ── 8. Output head ───────────────────────────────────────────────────
         self.output_dropout = nn.Dropout(output_dropout)
         self.output_head = nn.Linear(d_ff, num_phases)
+
+    def to(self, *args, **kwargs):
+        """Override to avoid moving quantised LLM when QLoRA is active."""
+        if self._use_qlora:
+            # 4-bit quantised layers are pinned to their CUDA device by bitsandbytes.
+            # Move every other module normally; leave self.llm untouched.
+            for name, child in self.named_children():
+                if name != "llm":
+                    child.to(*args, **kwargs)
+            # Keep buffers (prompt_emb, etc.) on the same device as non-LLM modules
+            for buf_name, buf in self.named_buffers():
+                if not buf_name.startswith("llm."):
+                    setattr(self, buf_name.split(".")[-1],
+                            buf.to(*args, **kwargs))
+            return self
+        return super().to(*args, **kwargs)
 
     # ── Prompt KV cache ──────────────────────────────────────────────────────
 
@@ -334,7 +534,17 @@ class SurgicalPhaseLLM(nn.Module):
         Compute and cache the prompt's KV pairs from the frozen LLM.
         Stored as legacy tuple format so each forward_clip builds a fresh
         DynamicCache — prevents in-place mutation across clips.
+
+        Returns None when QLoRA is active: prompt is prepended directly
+        each forward pass to avoid stale cached KVs after LoRA updates.
         """
+        if self._use_qlora:
+            # QLoRA: LoRA adapters change K/V projections during training →
+            # a cached KV from before an optimizer step would be wrong.
+            # forward_clip prepends prompt_emb directly instead.
+            self._prompt_kv = None
+            return None
+
         device = self.prompt_emb.device
         out = self.llm(
             inputs_embeds=self.prompt_emb.to(device),
@@ -405,6 +615,7 @@ class SurgicalPhaseLLM(nn.Module):
         memory: torch.Tensor = None,
         prev_visual: torch.Tensor = None,
         prompt_kv: tuple = None,
+        ablate_visual: bool = False,
     ):
         """
         Process one T-frame clip.
@@ -466,54 +677,71 @@ class SurgicalPhaseLLM(nn.Module):
             visual_tokens, hints, memory
         )                                                               # enriched: (B, N, d_llm)
 
-        # 5. Build LLM input sequence ─────────────────────────────────────────
-        # Order matches the prompt description exactly:
-        #   [Global memory] | [Local hints] | [Tool context] |
-        #   [Previous clip context] | [Visual tokens]
-        parts = []
-        if enriched_memory is not None:
-            parts.append(enriched_memory)                               # [Global memory tokens]
-        elif memory is not None:
-            parts.append(memory)                                        # first-clip fallback
-        parts.append(hints)                                             # [Local hint tokens]
-        if tool_annots is not None:
-            parts.append(self._make_tool_emb(tool_annots))             # [Tool context]
-        if prev_visual is not None:
-            parts.append(self.local_compressor(prev_visual))           # [Previous clip context]
-        parts.append(visual_tokens)                                     # [Visual tokens]
-
+        # 5. Build LLM input sequence (interleaved text headers + token groups)
+        # Each token group is immediately preceded by its section header so the
+        # LLM sees "what these tokens are" right at the point they appear —
+        # the same pattern used in time-series LLM reprogramming papers.
         llm_dtype = next(self.llm.parameters()).dtype
+
+        def _seg(buf: torch.Tensor) -> torch.Tensor:
+            """Expand pre-embedded header (1, L, d) → (B, L, d) and cast dtype."""
+            return buf.expand(B, -1, -1).to(llm_dtype)
+
+        parts = []
+        mem_tokens = enriched_memory if enriched_memory is not None else memory
+        if mem_tokens is not None:
+            parts.append(_seg(self.seg_memory_emb))                     # "Global context:"
+            parts.append(mem_tokens)                                    # [memory tokens]
+
+        parts.append(_seg(self.seg_hints_emb))                         # "Visual summary:"
+        parts.append(hints)                                             # [hint tokens]
+
+        if tool_annots is not None:
+            parts.append(self._make_tool_emb(tool_annots))             # "Tool context: ..."
+
+        if prev_visual is not None:
+            parts.append(_seg(self.seg_prev_emb))                      # "Previous clip:"
+            parts.append(self.local_compressor(prev_visual))           # [prev tokens]
+
+        parts.append(_seg(self.seg_visual_emb))                        # "Visual tokens:"
+        vt = torch.zeros_like(visual_tokens) if ablate_visual else visual_tokens
+        parts.append(vt)                                                # [visual tokens]
+
         llm_input = torch.cat([p.to(llm_dtype) for p in parts], dim=1)  # (B, *, d_llm)
 
-        # 6. Frozen LLM forward ───────────────────────────────────────────────
-        # Fresh DynamicCache each clip so the stored prompt tensors are not
-        # mutated in-place (which would break the second backward call).
-        if isinstance(prompt_kv, tuple):
-            kv_cache = DynamicCache.from_legacy_cache(prompt_kv)
+        # 6. LLM forward ──────────────────────────────────────────────────────
+        if prompt_kv is not None:
+            # Frozen-LLM mode: reuse cached prompt KV (fast, no re-encoding prompt).
+            # Fresh DynamicCache each clip so stored tensors are not mutated in-place.
+            kv_cache = (
+                DynamicCache.from_legacy_cache(prompt_kv)
+                if isinstance(prompt_kv, tuple)
+                else prompt_kv
+            )
+            lm_out = self.llm(
+                inputs_embeds=llm_input,
+                past_key_values=kv_cache,
+                use_cache=False,
+                output_hidden_states=True,
+            )
         else:
-            kv_cache = prompt_kv
-
-        lm_out = self.llm(
-            inputs_embeds=llm_input,
-            past_key_values=kv_cache,
-            use_cache=False,
-            output_hidden_states=True,
-        )
+            # QLoRA / no-cache mode: prepend prompt embeddings directly each clip.
+            # LoRA adapters update K/V projections every step, so cached KVs would
+            # be stale. Concatenating prompt_emb keeps the full context visible.
+            prefix = self.prompt_emb.expand(B, -1, -1).to(llm_dtype)
+            full_input = torch.cat([prefix, llm_input], dim=1)  # (B, P+*, d_llm)
+            lm_out = self.llm(
+                inputs_embeds=full_input,
+                use_cache=False,
+                output_hidden_states=True,
+            )
         # 7. Extract frame positions and predict ──────────────────────────────
         # Fuse middle layer + second-to-last layer hidden states.
         # hidden_states[0] = embedding output, [-1] = final layer.
         # hidden_states[0]=embedding, hidden_states[-1]=last transformer layer (before LM head)
-        num_hidden = len(lm_out.hidden_states)
-        mid_hidden   = lm_out.hidden_states[num_hidden // 2][:, -T:, :self.d_ff].float()
         final_hidden = lm_out.hidden_states[-1][:, -T:, :self.d_ff].float()
 
-        # Content-aware gate: per-frame per-dim blend of mid vs final
-        gate = torch.sigmoid(
-            self.llm_gate_proj(torch.cat([mid_hidden, final_hidden], dim=-1))
-        )                                                               # (B, T, d_ff)
-        fused = gate * mid_hidden + (1.0 - gate) * final_hidden        # (B, T, d_ff)
-        frame_hidden = self.layer_fusion(fused)                        # (B, T, d_ff)
-        logits = self.output_head(self.output_dropout(frame_hidden))  # (B, T, num_phases)
+        logits = self.output_head(self.output_dropout(final_hidden))  # (B, T, num_phases)
 
         return (
             logits, new_memory.detach(), visual_tokens.detach(),
@@ -556,4 +784,9 @@ class SurgicalPhaseLLM(nn.Module):
             output_dropout   = m.output_dropout,
             visual_backbone       = m.get("visual_backbone", "vmamba"),
             clip_trainable_layers = m.get("clip_trainable_layers", 0),
+            use_qlora             = m.get("use_qlora", False),
+            qlora_r               = m.get("qlora_r", 8),
+            qlora_alpha           = m.get("qlora_alpha", 16),
+            qlora_dropout         = m.get("qlora_dropout", 0.05),
+            qlora_target_modules  = m.get("qlora_target_modules", None),
         )

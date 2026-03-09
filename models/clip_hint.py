@@ -95,12 +95,20 @@ class ClipHintEncoder(nn.Module):
         dropout: float = 0.1,
         max_seq: int = 512,
         n_blocks: int = 2,
+        init_embeddings: torch.Tensor = None,
     ):
         super().__init__()
         self.n_hints = n_hints
 
-        # Learnable query tokens — each learns what to look for across all clips
-        self.hint_queries = nn.Parameter(torch.randn(1, n_hints, d_llm) * 0.02)
+        # Learnable query tokens — initialized from phase/tool text embeddings if provided,
+        # otherwise small random normal (standard init).
+        if init_embeddings is not None:
+            # init_embeddings: (n_hints, d_llm) — LLM embeddings of surgical concepts.
+            # Gives each query a meaningful starting direction (phase/tool semantics)
+            # instead of an arbitrary random point in embedding space.
+            self.hint_queries = nn.Parameter(init_embeddings.unsqueeze(0).clone().float())
+        else:
+            self.hint_queries = nn.Parameter(torch.randn(1, n_hints, d_llm) * 0.02)
 
         # Iterative Q-Former blocks
         self.blocks = nn.ModuleList([

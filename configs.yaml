@@ -3,14 +3,14 @@
 # ============================================================
 
 model:
-  llm_model_name: "HuggingFaceTB/SmolLM2-1.7B"  # HuggingFace model ID (hidden_size=896)
+  llm_model_name: "HuggingFaceTB/SmolLM2-360M"  # HuggingFace model ID (hidden_size=896)
   num_phases: 7                           # CholecT80: 7 surgical phases
-  visual_backbone: "clip"                         # "vmamba" | "clip"
+  visual_backbone: "vmamba"                         # "vmamba" | "clip"
   vmamba_pretrained: "./pretrained/vssmtiny.pth"  # VMamba-Tiny ImageNet pretrained (vmamba only)
 
   # ── Visual projector (Linear + ReprogrammingLayer) ───────────────────────
   n_heads: 8                       # heads for reprogramming cross-attention
-  d_ff: 512                        # output bottleneck (first d_ff dims of LLM hidden states)
+  d_ff: 256                        # output bottleneck (first d_ff dims of LLM hidden states)
   num_tokens: 1000                 # vocabulary reduction for reprogramming K/V (Qwen vocab=151936)
 
   # ── Temporal refiner (Multi-Scale Causal Depthwise Conv) ────────────────────
@@ -34,12 +34,26 @@ model:
   local_context_ratio: 4            # temporal downsampling factor (4 → T//4 tokens)
 
   # ── Freeze settings ───────────────────────────────────────────────────────
-  freeze_llm: true                 # freeze LLM (early layers)
+  freeze_llm: false                 # freeze LLM (early layers)
   llm_trainable_layers: 0          # unfreeze last N transformer layers (0=fully frozen)
   use_mapping_layer: false         # true=trainable 151M vocab→num_tokens, false=frozen LLM embeddings (TimesLLM style)
-  freeze_vmamba: true              # freeze VMamba backbone / CLIP vision encoder
+  freeze_vmamba: false              # freeze VMamba backbone / CLIP vision encoder
   vmamba_trainable_stages: 1       # vmamba only: unfreeze last N stages (0=fully frozen)
   clip_trainable_layers: 0         # clip only: unfreeze last N ViT layers (0=fully frozen, ViT-L/14 has 24 total)
+
+  # ── QLoRA fine-tuning (requires: pip install bitsandbytes peft) ───────────
+  # When use_qlora=true: LLM is loaded in 4-bit NF4 + LoRA adapters applied.
+  # KV caching is automatically disabled (LoRA updates K/V projections each step).
+  # Set freeze_llm=false when using QLoRA (LoRA params are trained instead).
+  use_qlora: true
+  qlora_r: 8                       # LoRA rank (higher = more capacity, more VRAM)
+  qlora_alpha: 16                  # LoRA scaling factor (effective lr = alpha/r)
+  qlora_dropout: 0.05
+  # ["q_proj","v_proj"]       — original LoRA paper recommendation (fewer params, often enough)
+  # ["q_proj","k_proj","v_proj"] — add keys for stronger adaptation
+  # ["q_proj","k_proj","v_proj","o_proj"] — all attention projections (most expressive)
+  # null → auto-detect ["q_proj","v_proj"] for Llama/Qwen/SmolLM2
+  qlora_target_modules: ["q_proj","v_proj"]
 
   # ── Regularization ────────────────────────────────────────────────────────
   attention_dropout: 0.1           # ReprogrammingLayer attention dropout
