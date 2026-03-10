@@ -369,9 +369,30 @@ def evaluate_test(model: SurgicalPhaseLLM, cfg, device: torch.device, epoch: int
 
 
 def build_optimizer(model: SurgicalPhaseLLM, cfg):
-    trainable = [p for p in model.parameters() if p.requires_grad]
+    use_lora       = cfg.model.get("use_lora", False)
+    lora_lr_factor = cfg.train.get("lora_lr_factor", 0.1)
+    base_lr        = cfg.train.lr
+    wd             = cfg.train.weight_decay
+
+    if use_lora:
+        # LoRA adapters need a lower lr than the rest of the model:
+        # they're a small delta on top of a pre-trained LLM, so large
+        # updates would destroy the pre-trained knowledge.
+        lora_params  = [(n, p) for n, p in model.named_parameters()
+                        if p.requires_grad and ("lora_A" in n or "lora_B" in n)]
+        other_params = [(n, p) for n, p in model.named_parameters()
+                        if p.requires_grad and "lora_A" not in n and "lora_B" not in n]
+        print(f"Optimizer: LoRA params={len(lora_params)} (lr={base_lr*lora_lr_factor:.2e}), "
+              f"other params={len(other_params)} (lr={base_lr:.2e})")
+        param_groups = [
+            {"params": [p for _, p in other_params], "lr": base_lr},
+            {"params": [p for _, p in lora_params],  "lr": base_lr * lora_lr_factor},
+        ]
+    else:
+        param_groups = [p for p in model.parameters() if p.requires_grad]
+
     if cfg.train.optimizer.lower() == "adamw":
-        return torch.optim.AdamW(trainable, lr=cfg.train.lr, weight_decay=cfg.train.weight_decay)
+        return torch.optim.AdamW(param_groups, lr=base_lr, weight_decay=wd)
     raise ValueError(f"Unknown optimizer: {cfg.train.optimizer}")
 
 

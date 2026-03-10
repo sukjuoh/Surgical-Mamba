@@ -59,18 +59,24 @@ class QFormerBlock(nn.Module):
         )
         self.norm_ff = nn.LayerNorm(d_llm)
 
-    def forward(self, q: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, q: torch.Tensor, v: torch.Tensor, return_attn: bool = False
+    ):
         """
         q: (B, N_hints, d_llm)
         v: (B, T,       d_visual)
+        return_attn: if True, also return cross-attn weights (B, N_hints, T)
         """
         sa, _ = self.self_attn(q, q, q)
         q = self.norm_sa(q + sa)
 
-        ca, _ = self.cross_attn(q, v, v)
+        ca, attn_weights = self.cross_attn(q, v, v, need_weights=return_attn,
+                                           average_attn_weights=True)
         q = self.norm_ca(q + ca)
 
         q = self.norm_ff(q + self.ff(q))
+        if return_attn:
+            return q, attn_weights  # attn_weights: (B, N_hints, T)
         return q
 
 
@@ -116,6 +122,34 @@ class ClipHintEncoder(nn.Module):
             for _ in range(n_blocks)
         ])
         self.final_norm = nn.LayerNorm(d_llm)
+        
+    def _attention_focus_loss(self, attn_weights: torch.Tensor, T: int) -> torch.Tensor:
+        """
+        Attention focus loss: penalises hint i for not concentrating its attention
+        on its assigned temporal segment.
+
+        For hint i assigned to segment [start_i, end_i]:
+            in_seg = sum of attn_weights[i, start_i:end_i]  ∈ [0, 1]
+            loss   = 1 - in_seg   (0 = perfect focus, 1 = no attention in segment)
+
+        Unlike contrastive losses, this works regardless of phase feature distinctiveness —
+        it purely measures "did hint i look at the right frames?"
+
+        Args:
+            attn_weights: (B, N_hints, T)  attention probabilities from cross_attn
+            T:            clip length
+        Returns:
+            scalar loss (mean over hints and batch)
+        """
+        N = self.n_hints
+        seg_size = max(T // N, 1)
+        total = attn_weights.new_tensor(0.0)
+        for i in range(N):
+            start  = i * seg_size
+            end    = start + seg_size if i < N - 1 else T
+            in_seg = attn_weights[:, i, start:end].sum(dim=-1)  # (B,)
+            total  = total + (1.0 - in_seg).mean()
+        return total / N
 
     def forward(self, visual_feats: torch.Tensor):
         """
@@ -123,15 +157,21 @@ class ClipHintEncoder(nn.Module):
             visual_feats: (B, T, d_visual)  temporally-refined VMamba features
         Returns:
             hints:           (B, N_hints, d_llm)
-            attn_focus_loss: scalar 0.0  (kept for API compatibility)
+            attn_focus_loss: scalar — attention focus loss from last block's cross-attn
         """
-        B = visual_feats.shape[0]
+        B, T, _ = visual_feats.shape
 
         # Expand learnable queries over batch
         q = self.hint_queries.expand(B, -1, -1)    # (B, N_hints, d_llm)
 
-        # Iterative refinement: each block refines q using visual features
-        for block in self.blocks:
-            q = block(q, visual_feats)              # (B, N_hints, d_llm)
+        # All blocks except last: standard forward
+        for block in self.blocks[:-1]:
+            q = block(q, visual_feats)
 
-        return self.final_norm(q), visual_feats.new_tensor(0.0)
+        # Last block: capture cross-attention weights for focus loss
+        q, attn_weights = self.blocks[-1](q, visual_feats, return_attn=True)
+        # attn_weights: (B, N_hints, T)
+
+        attn_focus_loss = self._attention_focus_loss(attn_weights, T)
+
+        return self.final_norm(q), attn_focus_loss

@@ -2,11 +2,6 @@
 VMamba Tiny feature extractor for surgical phase recognition.
 Outputs pooled feature vectors by removing the classification head from VSSM.
 
-Variants:
-  - VMambaTinyExtractor     : VMamba-Tiny v2 (Mamba1-based, forward_type="v05_noz")
-  - VMambaTinyM2Extractor   : VMamba-Tiny Mamba2-based (forward_type="m0_noz")
-  - CLIPExtractor           : CLIP ViT-L/14 with attention pooling → 768-dim
-
 Reference: https://github.com/MzeroMiko/VMamba
 """
 

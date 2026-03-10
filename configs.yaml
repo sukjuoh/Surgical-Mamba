@@ -33,27 +33,26 @@ model:
   # tokens prepended to LLM input as dense local context.
   local_context_ratio: 4            # temporal downsampling factor (4 → T//4 tokens)
 
-  # ── Freeze settings ───────────────────────────────────────────────────────
-  freeze_llm: false                 # freeze LLM (early layers)
-  llm_trainable_layers: 0          # unfreeze last N transformer layers (0=fully frozen)
-  use_mapping_layer: false         # true=trainable 151M vocab→num_tokens, false=frozen LLM embeddings (TimesLLM style)
-  freeze_vmamba: false              # freeze VMamba backbone / CLIP vision encoder
-  vmamba_trainable_stages: 1       # vmamba only: unfreeze last N stages (0=fully frozen)
-  clip_trainable_layers: 0         # clip only: unfreeze last N ViT layers (0=fully frozen, ViT-L/14 has 24 total)
-
-  # ── LoRA fine-tuning (requires: pip install peft) ────────────────────────
-  # Plain LoRA (no quantization): appropriate for small LLMs (≤1B).
-  # Base model stays in FP16; only LoRA adapter weights are trained.
-  # KV caching is automatically disabled when use_lora=true.
-  # Set freeze_llm=false when using LoRA (LoRA params are trained instead).
+  # ── Trainable layers ──────────────────────────────────────────────────────
+  # LLM options (pick one):
+  #   frozen:       llm_trainable_layers=0, use_lora=false, llm_full_finetune=false
+  #   partial:      llm_trainable_layers=N (unfreeze last N layers)
+  #   LoRA:         use_lora=true
+  #   full finetune: llm_full_finetune=true
+  llm_trainable_layers: 0
+  llm_full_finetune: false
   use_lora: true
-  lora_r: 8                        # LoRA rank (higher = more capacity, more VRAM)
-  lora_alpha: 16                   # LoRA scaling factor (effective lr = alpha/r)
+  lora_r: 8                        # LoRA rank
+  lora_alpha: 16                   # LoRA scaling = alpha/r
   lora_dropout: 0.05
-  # ["q_proj","v_proj"]         — original LoRA paper recommendation
-  # ["q_proj","k_proj","v_proj"] — add keys for stronger adaptation
-  # null → default ["q_proj","v_proj"]
-  lora_target_modules: ["q_proj","v_proj"]
+  lora_target_modules: null        # null→["q_proj","v_proj"] | ["q_proj","k_proj","v_proj"]
+
+  # VMamba: 0=frozen | N>0=last N stages | 4=full finetune (VMamba-Tiny has 4 stages)
+  vmamba_trainable_stages: 1
+  # CLIP (visual_backbone="clip" only): 0=frozen | N>0=last N ViT layers | 24=full
+  clip_trainable_layers: 0
+
+  use_mapping_layer: false         # true=learnable vocab→num_tokens mapping
 
   # ── Regularization ────────────────────────────────────────────────────────
   attention_dropout: 0.1           # ReprogrammingLayer attention dropout
@@ -132,13 +131,14 @@ train:
 
   num_workers: 0          # 0 = main process only (avoids shm issues in containers)
 
-  epochs: 50
+  epochs: 100
   warmup_epochs: 10
 
   use_amp: True            # mixed precision (fp16) — saves ~40% VRAM
 
   optimizer: "adamw"
-  lr: 0.00005
+  lr: 0.00001
+  lora_lr_factor: 0.1              # LoRA adapter lr = lr × factor (lower to preserve pretrained weights)
   weight_decay: 0.01
   grad_clip: 1.0
 
@@ -146,7 +146,7 @@ train:
   label_smoothing: 0.1   # CE label smoothing (0.1 = soft targets)
   w_smooth:        0.1   # temporal smoothness loss weight (all adjacent pairs)
   w_diversity:     0.1   # hint diversity loss weight
-  w_attn_focus:    0.1   # hint attention focus loss weight
+  w_attn_focus:    0.05  # hint attention focus loss weight
 
   # Learning rate scheduler
   scheduler: "cosine"              # "cosine" | "step" | null

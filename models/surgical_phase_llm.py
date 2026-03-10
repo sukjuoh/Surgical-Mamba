@@ -1,46 +1,5 @@
 """
 Surgical Phase Recognition via LLM Reprogramming.
-
-Architecture (per clip):
-
-  frames (B, T, 3, H, W)
-       │
-       ▼ VMamba-Tiny extractor
-  visual_feats (B, T, 768)
-       │
-       ▼ TemporalRefiner (Mamba2 × N layers)
-  refined_feats (B, T, 768)   — temporally-aware frame features
-       │
-       ├──────────────────────────────────────┐
-       │  VisualProjector                     │ ClipHintEncoder
-       │  ┌──────────────────────────────┐    │  temporal-segment biased queries
-       │  │ direct = Linear(768→d_llm)   │    │  + transition stream (frame diffs)
-       │  │ reprogram = Reprogram(...)   │    │  + slot embeddings + self-attn + FFN
-       │  │ fused = LN(direct+reprogram) │    │  → (B, N_hints, d_llm)
-       │  │ visual_tokens = LN(fused     │    │
-       │  │               + FFN(fused))  │    │
-       │  └──────────┬───────────────────┘    │
-       │             │ visual_tokens           │ hint_tokens (B, N_hints, d_llm)
-       └─────────────┼────────────────────────┘
-                     │
-  Cross-clip context (from previous clip, both detached):
-    prev_memory  (B, N_hints, d_llm)  — Mamba SSM global summary of all past clips
-    prev_visual  (B, T, d_llm)        → LocalContextCompressor → (B, T//4, d_llm)
-                     │
-                     ▼
-  LLM input: [enriched_memory(N_hints) | hint_tokens | tool_text | compressed_prev(T//4) | visual_tokens]
-  with past_key_values = prompt_kv (fixed, computed once per video)
-                     │
-                     ▼ Frozen LLM
-  hidden (B, *, d_llm)
-                     │
-   take last T positions, first d_ff dims
-                     │
-                     ▼ output_head
-  logits (B, T, num_phases)
-
-  + new_memory = CrossClipMemory(hints, prev_memory)  → passed to next clip (detached)
-  + visual_tokens (detached)                          → passed to next clip as prev_visual
 """
 
 import torch
@@ -436,6 +395,20 @@ class SurgicalPhaseLLM(nn.Module):
         )
         self.visual_norm2 = nn.LayerNorm(self.d_llm)
 
+        # ── Visual token norm alignment ───────────────────────────────────────
+        # After LayerNorm, visual tokens have norm ≈ sqrt(d_llm) (std≈1 per dim).
+        # LLM word embeddings typically have a different norm depending on the
+        # model's embedding table. Mismatched norms cause the LLM to under-weight
+        # or over-weight visual tokens relative to text tokens.
+        # Solution: a single learnable scalar initialized so that
+        #   avg(visual_token_norm) ≈ avg(LLM_embedding_norm)
+        with torch.no_grad():
+            emb_norms = word_emb_weight.norm(dim=-1).float()  # (V,)
+            target_norm = emb_norms.mean().item()
+        # LayerNorm output has norm ≈ sqrt(d_llm); scale to match LLM embedding norm
+        init_scale = target_norm / (self.d_llm ** 0.5)
+        self.visual_scale = nn.Parameter(torch.tensor(init_scale))
+
         # ── 5. Clip hint encoder ─────────────────────────────────────────────
         # Initialize hint queries from LLM embeddings of phase/tool names so
         # each query starts "looking for" a specific surgical concept rather
@@ -631,6 +604,9 @@ class SurgicalPhaseLLM(nn.Module):
         fused = self.visual_norm1(direct + reprogram)                  # (B, T, d_llm)
         # Residual 2: FFN
         visual_tokens = self.visual_norm2(fused + self.visual_ffn(fused))  # (B, T, d_llm)
+        # Align visual token norms with LLM embedding norms so the LLM does
+        # not discount visual tokens due to scale mismatch.
+        visual_tokens = visual_tokens * self.visual_scale              # (B, T, d_llm)
 
         # 4. Clip hint tokens ─────────────────────────────────────────────────
         hints, attn_focus_loss = self.hint_encoder(feats)               # (B, N_hints, d_llm)
@@ -733,15 +709,22 @@ class SurgicalPhaseLLM(nn.Module):
     def from_config(cls, cfg: DictConfig) -> "SurgicalPhaseLLM":
         """Build model from OmegaConf config (cfg.model section)."""
         m = cfg.model
+        use_lora          = m.get("use_lora", False)
+        llm_full_finetune = m.get("llm_full_finetune", False)
+        llm_trainable     = m.get("llm_trainable_layers", 0)
+        vmamba_stages     = m.get("vmamba_trainable_stages", 0)
+
         return cls(
             llm_model_name   = m.llm_model_name,
             num_phases       = m.num_phases,
             vmamba_pretrained= m.vmamba_pretrained,
-            freeze_llm              = m.freeze_llm,
-            llm_trainable_layers    = m.get("llm_trainable_layers", 0),
-            freeze_vmamba           = m.freeze_vmamba,
-            use_mapping_layer       = m.get("use_mapping_layer", True),
-            vmamba_trainable_stages = m.get("vmamba_trainable_stages", 0),
+            # freeze_llm=False → all params trainable; True → freeze then partially unfreeze
+            freeze_llm              = not use_lora and not llm_full_finetune,
+            llm_trainable_layers    = llm_trainable,
+            # freeze_vmamba: always freeze first, then selectively unfreeze via stages
+            freeze_vmamba           = True,
+            use_mapping_layer       = m.get("use_mapping_layer", False),
+            vmamba_trainable_stages = vmamba_stages,
             mamba_layers            = m.mamba_layers,
             n_heads          = m.n_heads,
             d_ff             = m.d_ff,
