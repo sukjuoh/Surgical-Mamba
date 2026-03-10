@@ -216,63 +216,6 @@ def run_video_inference(
     return torch.cat(all_logits, dim=0), torch.cat(all_labels, dim=0)
 
 
-def temporal_smooth_logits(logits: torch.Tensor, window: int = 15) -> torch.Tensor:
-    """
-    Soft temporal smoothing: average softmax probabilities over a sliding window.
-
-    Applies symmetric avg-pool over the time axis so each frame's final
-    probability is the mean of its ±(window//2) neighbours.  Preserves
-    temporal length exactly.
-
-    Args:
-        logits: (N, C) — raw per-frame logits
-        window: sliding window size (odd recommended)
-    Returns:
-        (N, C) — smoothed probability vectors (sum to 1 along C)
-    """
-    probs = torch.softmax(logits, dim=-1)               # (N, C)
-    # avg_pool1d expects (B, C, L) — treat frames as the length dimension
-    probs_t  = probs.T.unsqueeze(0)                     # (1, C, N)
-    pad      = window // 2
-    smoothed = nn.functional.avg_pool1d(
-        probs_t, kernel_size=window, stride=1, padding=pad
-    )
-    return smoothed.squeeze(0).T                        # (N, C)
-
-
-def remove_short_segments(preds: torch.Tensor, min_len: int = 10) -> torch.Tensor:
-    """
-    Remove phase segments shorter than min_len frames.
-
-    Short isolated segments (e.g., a 3-frame "blip" of phase 2 inside phase 1)
-    are replaced by the left neighbour (or right neighbour at the video start).
-    Iterates until no segment shorter than min_len remains.
-
-    Args:
-        preds:   (N,) int64 frame-level predictions
-        min_len: minimum acceptable segment length in frames
-    Returns:
-        (N,) cleaned predictions
-    """
-    p = preds.tolist()
-    N = len(p)
-    changed = True
-    while changed:
-        changed = False
-        i = 0
-        while i < N:
-            ph = p[i]
-            j  = i
-            while j < N and p[j] == ph:
-                j += 1
-            if (j - i) < min_len:
-                # Replace with left neighbour; fall back to right if at start
-                fill = p[i - 1] if i > 0 else (p[j] if j < N else ph)
-                for k in range(i, j):
-                    p[k] = fill
-                changed = True
-            i = j
-    return torch.tensor(p, dtype=preds.dtype)
 
 
 def compute_cls_metrics(
@@ -331,13 +274,7 @@ def evaluate_test(model: SurgicalPhaseLLM, cfg, device: torch.device, epoch: int
     model.eval()
     for video_id in cfg.data.test_videos:
         logits, labels = run_video_inference(model, video_id, cfg, device)
-
-        # 1. Temporal soft smoothing
-        smoothed = temporal_smooth_logits(logits, window=smooth_window)  # (N, C)
-        preds    = smoothed.argmax(dim=-1)                                # (N,)
-
-        # 2. Short-segment removal
-        preds = remove_short_segments(preds, min_len=min_seg_len)
+        preds    = logits.argmax(dim=-1)                                # (N,)
 
         video_metrics.append(compute_cls_metrics(preds, labels, num_phases))
 
@@ -369,30 +306,9 @@ def evaluate_test(model: SurgicalPhaseLLM, cfg, device: torch.device, epoch: int
 
 
 def build_optimizer(model: SurgicalPhaseLLM, cfg):
-    use_lora       = cfg.model.get("use_lora", False)
-    lora_lr_factor = cfg.train.get("lora_lr_factor", 0.1)
-    base_lr        = cfg.train.lr
-    wd             = cfg.train.weight_decay
-
-    if use_lora:
-        # LoRA adapters need a lower lr than the rest of the model:
-        # they're a small delta on top of a pre-trained LLM, so large
-        # updates would destroy the pre-trained knowledge.
-        lora_params  = [(n, p) for n, p in model.named_parameters()
-                        if p.requires_grad and ("lora_A" in n or "lora_B" in n)]
-        other_params = [(n, p) for n, p in model.named_parameters()
-                        if p.requires_grad and "lora_A" not in n and "lora_B" not in n]
-        print(f"Optimizer: LoRA params={len(lora_params)} (lr={base_lr*lora_lr_factor:.2e}), "
-              f"other params={len(other_params)} (lr={base_lr:.2e})")
-        param_groups = [
-            {"params": [p for _, p in other_params], "lr": base_lr},
-            {"params": [p for _, p in lora_params],  "lr": base_lr * lora_lr_factor},
-        ]
-    else:
-        param_groups = [p for p in model.parameters() if p.requires_grad]
-
+    trainable = [p for p in model.parameters() if p.requires_grad]
     if cfg.train.optimizer.lower() == "adamw":
-        return torch.optim.AdamW(param_groups, lr=base_lr, weight_decay=wd)
+        return torch.optim.AdamW(trainable, lr=cfg.train.lr, weight_decay=cfg.train.weight_decay)
     raise ValueError(f"Unknown optimizer: {cfg.train.optimizer}")
 
 

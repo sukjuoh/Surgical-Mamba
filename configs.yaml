@@ -137,7 +137,7 @@ train:
   use_amp: True            # mixed precision (fp16) — saves ~40% VRAM
 
   optimizer: "adamw"
-  lr: 0.00001
+  lr: 0.00005
   lora_lr_factor: 0.1              # LoRA adapter lr = lr × factor (lower to preserve pretrained weights)
   weight_decay: 0.01
   grad_clip: 1.0
@@ -159,5 +159,3 @@ train:
 
   # ── Test evaluation ───────────────────────────────────────────────────────
   test_eval_interval: 10           # run test evaluation every N epochs
-  test_smooth_window: 15           # sliding-window size for temporal soft smoothing
-  test_min_segment:   10           # minimum segment length (frames) for short-seg removal

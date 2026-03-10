@@ -559,6 +559,12 @@ class SurgicalPhaseLLM(nn.Module):
         prev_visual: torch.Tensor = None,
         prompt_kv: tuple = None,
         ablate_visual: bool = False,
+        ablate_hints: bool = False,
+        ablate_tool: bool = False,
+        ablate_memory: bool = False,
+        ablate_prev: bool = False,
+        ablate_prompt: bool = False,
+        output_attentions: bool = False,
     ):
         """
         Process one T-frame clip.
@@ -612,53 +618,61 @@ class SurgicalPhaseLLM(nn.Module):
         hints, attn_focus_loss = self.hint_encoder(feats)               # (B, N_hints, d_llm)
 
         # 4b. Cross-clip memory update ────────────────────────────────────────
-        # Read:  prev_memory(Q) × visual_tokens(K/V) → enriched_memory (B, N, d)
-        #   Each memory slot attends to the current clip and refreshes itself.
-        #   enriched_memory replaces raw memory in the LLM prefix, giving the
-        #   LLM a global context tuned to the current clip.
-        #   visual_tokens are untouched — clean separation of roles.
-        # Write: Mamba([prev_memory | raw hints])[-N:] → new_memory
-        #   Stored (detached) for the NEXT clip; independent of read path.
         new_memory, enriched_memory = self.cross_clip_memory(
             visual_tokens, hints, memory
         )                                                               # enriched: (B, N, d_llm)
 
         # 5. Build LLM input sequence (interleaved text headers + token groups)
-        # Each token group is immediately preceded by its section header so the
-        # LLM sees "what these tokens are" right at the point they appear —
-        # the same pattern used in time-series LLM reprogramming papers.
         llm_dtype = next(self.llm.parameters()).dtype
 
         def _seg(buf: torch.Tensor) -> torch.Tensor:
-            """Expand pre-embedded header (1, L, d) → (B, L, d) and cast dtype."""
             return buf.expand(B, -1, -1).to(llm_dtype)
 
         parts = []
-        mem_tokens = enriched_memory if enriched_memory is not None else memory
-        if mem_tokens is not None:
-            parts.append(_seg(self.seg_memory_emb))                     # "Global context:"
-            parts.append(mem_tokens)                                    # [memory tokens]
+        regions = {}   # name → (start, end) relative to llm_input start (offset by prompt_len later)
+        pos = 0
 
-        parts.append(_seg(self.seg_hints_emb))                         # "Visual summary:"
-        parts.append(hints)                                             # [hint tokens]
+        def _add(name, tensor):
+            nonlocal pos
+            l = tensor.shape[1]
+            regions[name] = (pos, pos + l)
+            pos += l
+            parts.append(tensor)
 
-        if tool_annots is not None:
-            parts.append(self._make_tool_emb(tool_annots))             # "Tool context: ..."
+        if not ablate_memory:
+            mem_tokens = enriched_memory if enriched_memory is not None else memory
+            if mem_tokens is not None:
+                _add("memory_hdr", _seg(self.seg_memory_emb))
+                _add("memory",     mem_tokens.to(llm_dtype))
 
-        if prev_visual is not None:
-            parts.append(_seg(self.seg_prev_emb))                      # "Previous clip:"
-            parts.append(self.local_compressor(prev_visual))           # [prev tokens]
+        _add("hints_hdr", _seg(self.seg_hints_emb))
+        hints_in = torch.zeros_like(hints) if ablate_hints else hints
+        _add("hints", hints_in.to(llm_dtype))
 
-        parts.append(_seg(self.seg_visual_emb))                        # "Visual tokens:"
+        if not ablate_tool and tool_annots is not None:
+            _add("tool", self._make_tool_emb(tool_annots))
+
+        if not ablate_prev and prev_visual is not None:
+            _add("prev_hdr", _seg(self.seg_prev_emb))
+            _add("prev",     self.local_compressor(prev_visual).to(llm_dtype))
+
+        _add("visual_hdr", _seg(self.seg_visual_emb))
         vt = torch.zeros_like(visual_tokens) if ablate_visual else visual_tokens
-        parts.append(vt)                                                # [visual tokens]
+        _add("visual", vt.to(llm_dtype))
 
-        llm_input = torch.cat([p.to(llm_dtype) for p in parts], dim=1)  # (B, *, d_llm)
+        llm_input = torch.cat(parts, dim=1)  # (B, *, d_llm)
 
         # 6. LLM forward ──────────────────────────────────────────────────────
-        if prompt_kv is not None:
-            # Frozen-LLM mode: reuse cached prompt KV (fast, no re-encoding prompt).
-            # Fresh DynamicCache each clip so stored tensors are not mutated in-place.
+        prompt_len = 0
+        if ablate_prompt:
+            lm_out = self.llm(
+                inputs_embeds=llm_input,
+                use_cache=False,
+                output_hidden_states=True,
+                output_attentions=output_attentions,
+            )
+        elif prompt_kv is not None:
+            prompt_len = self.prompt_len
             kv_cache = (
                 DynamicCache.from_legacy_cache(prompt_kv)
                 if isinstance(prompt_kv, tuple)
@@ -669,25 +683,33 @@ class SurgicalPhaseLLM(nn.Module):
                 past_key_values=kv_cache,
                 use_cache=False,
                 output_hidden_states=True,
+                output_attentions=output_attentions,
             )
         else:
-            # QLoRA / no-cache mode: prepend prompt embeddings directly each clip.
-            # LoRA adapters update K/V projections every step, so cached KVs would
-            # be stale. Concatenating prompt_emb keeps the full context visible.
+            # LoRA mode: prepend prompt embeddings directly each clip.
             prefix = self.prompt_emb.expand(B, -1, -1).to(llm_dtype)
-            full_input = torch.cat([prefix, llm_input], dim=1)  # (B, P+*, d_llm)
+            prompt_len = prefix.shape[1]
+            full_input = torch.cat([prefix, llm_input], dim=1)
             lm_out = self.llm(
                 inputs_embeds=full_input,
                 use_cache=False,
                 output_hidden_states=True,
+                output_attentions=output_attentions,
             )
-        # 7. Extract frame positions and predict ──────────────────────────────
-        # Fuse middle layer + second-to-last layer hidden states.
-        # hidden_states[0] = embedding output, [-1] = final layer.
-        # hidden_states[0]=embedding, hidden_states[-1]=last transformer layer (before LM head)
-        final_hidden = lm_out.hidden_states[-1][:, -T:, :self.d_ff].float()
 
+        # 7. Extract frame positions and predict ──────────────────────────────
+        final_hidden = lm_out.hidden_states[-1][:, -T:, :self.d_ff].float()
         logits = self.output_head(self.output_dropout(final_hidden))  # (B, T, num_phases)
+
+        if output_attentions:
+            # Shift region boundaries by prompt_len so they index into the full sequence
+            shifted = {k: (s + prompt_len, e + prompt_len) for k, (s, e) in regions.items()}
+            shifted["prompt"] = (0, prompt_len)
+            return (
+                logits, new_memory.detach(), visual_tokens.detach(),
+                hints, attn_focus_loss,
+                lm_out.attentions, shifted,   # attentions + region map
+            )
 
         return (
             logits, new_memory.detach(), visual_tokens.detach(),

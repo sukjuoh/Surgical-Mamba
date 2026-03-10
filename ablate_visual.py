@@ -1,17 +1,20 @@
 """
-Visual Token Ablation Study
-============================
-Compares model accuracy with/without visual tokens to verify they are
-actually used by the LLM.
+Component Ablation Study
+=========================
+Measures the contribution of each LLM input component by zeroing it out
+and comparing accuracy against the full model.
+
+Components tested:
+  visual   — per-frame visual feature tokens (VMamba → reprogramming → projector)
+  hints    — clip-level summary tokens (ClipHintEncoder)
+  tool     — per-segment tool text embeddings
+  memory   — cross-clip global memory tokens
+  prev     — local context (previous clip visual tokens, compressed)
+  prompt   — static task description prefix
 
 Usage:
     conda run -n surgery_mamba python ablate_visual.py --ckpt checkpoints/best.pt
     conda run -n surgery_mamba python ablate_visual.py --ckpt checkpoints/best.pt --videos 41 42 43
-
-Options:
-    --ckpt     Path to checkpoint (.pt file with 'model_state_dict' key, or raw state_dict)
-    --videos   Space-separated video IDs to evaluate (default: val_videos from configs.yaml)
-    --config   Path to configs.yaml (default: ./configs.yaml next to this script)
 """
 
 import argparse
@@ -19,7 +22,6 @@ import os
 import sys
 
 import torch
-import torch.nn as nn
 from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
 
@@ -29,7 +31,7 @@ from models import SurgicalPhaseLLM
 from data.dataset import VideoClipDataset
 
 
-# ── Metrics ──────────────────────────────────────────────────────────────────
+# ── Metrics ───────────────────────────────────────────────────────────────────
 
 def compute_cls_metrics(preds: torch.Tensor, labels: torch.Tensor, num_classes: int) -> dict:
     acc = (preds == labels).float().mean().item()
@@ -52,20 +54,10 @@ def compute_cls_metrics(preds: torch.Tensor, labels: torch.Tensor, num_classes: 
     }
 
 
-def temporal_smooth_logits(logits: torch.Tensor, window: int = 15) -> torch.Tensor:
-    probs   = torch.softmax(logits, dim=-1)
-    probs_t = probs.T.unsqueeze(0)
-    pad     = window // 2
-    smoothed = nn.functional.avg_pool1d(
-        probs_t, kernel_size=window, stride=1, padding=pad
-    )
-    return smoothed.squeeze(0).T
-
-
-# ── Per-video inference ───────────────────────────────────────────────────────
+# ── Per-video inference ────────────────────────────────────────────────────────
 
 @torch.no_grad()
-def run_inference(model, video_id, cfg, device, ablate_visual=False):
+def run_inference(model, video_id, cfg, device, ablate_flags: dict):
     dataset = VideoClipDataset(
         video_id  = video_id,
         data_root = cfg.data.data_root,
@@ -77,7 +69,7 @@ def run_inference(model, video_id, cfg, device, ablate_visual=False):
     loader = DataLoader(dataset, batch_size=1, shuffle=False,
                         num_workers=cfg.train.num_workers, pin_memory=True)
 
-    prompt_kv   = model.build_prompt_kv()
+    prompt_kv   = None if ablate_flags.get("ablate_prompt") else model.build_prompt_kv()
     memory      = None
     prev_visual = None
     all_logits  = []
@@ -90,107 +82,113 @@ def run_inference(model, video_id, cfg, device, ablate_visual=False):
         valid_mask = valid_mask.to(device)
 
         logits, memory, prev_visual, _, _ = model.forward_clip(
-            frames        = frames,
-            tool_annots   = tools,
-            memory        = memory,
-            prev_visual   = prev_visual,
-            prompt_kv     = prompt_kv,
-            ablate_visual = ablate_visual,
+            frames      = frames,
+            tool_annots = tools,
+            memory      = memory,
+            prev_visual = prev_visual,
+            prompt_kv   = prompt_kv,
+            **ablate_flags,
         )
 
-        mask_sq  = valid_mask[0]
+        mask_sq = valid_mask[0]
         all_logits.append(logits[0][mask_sq].cpu())
         all_labels.append(labels[0][mask_sq].cpu())
 
     return torch.cat(all_logits), torch.cat(all_labels)
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
-
-def evaluate_videos(model, video_ids, cfg, device, ablate_visual, label):
-    smooth_window = cfg.train.get("test_smooth_window", 15)
-    min_seg_len   = cfg.train.get("test_min_segment",   10)
+def evaluate(model, video_ids, cfg, device, ablate_flags: dict, label: str) -> dict:
     num_phases    = cfg.data.num_phases
-
-    from train import remove_short_segments
-
     video_metrics = []
     for vid in video_ids:
-        print(f"  [{label}] video {vid:02d} ...", end=" ", flush=True)
-        logits, labels = run_inference(model, vid, cfg, device, ablate_visual)
-        smoothed = temporal_smooth_logits(logits, window=smooth_window)
-        preds    = smoothed.argmax(dim=-1)
-        preds    = remove_short_segments(preds, min_len=min_seg_len)
+        print(f"  [{label:<14}] video {vid:02d} ...", end=" ", flush=True)
+        logits, labels = run_inference(model, vid, cfg, device, ablate_flags)
+        preds = logits.argmax(dim=-1)
         m = compute_cls_metrics(preds, labels, num_phases)
         video_metrics.append(m)
         print(f"acc={m['acc']:.4f}")
+    return {k: sum(v[k] for v in video_metrics) / len(video_metrics)
+            for k in ["acc", "precision", "recall", "jaccard"]}
 
-    avg = {k: sum(v[k] for v in video_metrics) / len(video_metrics)
-           for k in ["acc", "precision", "recall", "jaccard"]}
-    return avg
 
+# ── Ablation conditions ────────────────────────────────────────────────────────
+
+# Each entry: (display label, ablate_flags dict)
+# ablate_flags are passed directly as kwargs to forward_clip.
+# "no memory" and "no prev" are achieved by never passing those tensors;
+# the corresponding flags tell forward_clip to ignore them even if present.
+ABLATION_CONDITIONS = [
+    ("FULL (baseline)",  {}),
+    ("no visual",        {"ablate_visual": True}),
+    ("no hints",         {"ablate_hints":  True}),
+    ("no tool text",     {"ablate_tool":   True}),
+    ("no memory",        {"ablate_memory": True}),
+    ("no prev clip",     {"ablate_prev":   True}),
+    ("no prompt",        {"ablate_prompt": True}),
+]
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--ckpt",   required=True, help="Checkpoint path")
-    parser.add_argument("--videos", nargs="+", type=int, default=None,
-                        help="Video IDs to evaluate (default: val_videos from config)")
-    parser.add_argument("--config", default=None, help="Path to configs.yaml")
+    parser.add_argument("--videos", nargs="+", type=int, default=None)
+    parser.add_argument("--config", default=None)
     args = parser.parse_args()
 
     config_path = args.config or os.path.join(os.path.dirname(__file__), "configs.yaml")
     cfg    = OmegaConf.load(config_path)
     device = torch.device(cfg.train.device if torch.cuda.is_available() else "cpu")
 
-    # ── Load model ────────────────────────────────────────────────────────────
     print(f"Loading checkpoint from {args.ckpt} ...")
     ckpt = torch.load(args.ckpt, map_location="cpu")
-
-    # Use config embedded in checkpoint if present (ensures backbone match)
     if "cfg" in ckpt:
         cfg = OmegaConf.merge(cfg, ckpt["cfg"])
-        print(f"  Using checkpoint cfg: visual_backbone={cfg.model.visual_backbone}")
+        print(f"  checkpoint cfg: visual_backbone={cfg.model.visual_backbone}")
 
     model = SurgicalPhaseLLM.from_config(cfg).to(device)
-
-    # Support both 'model' and 'model_state_dict' keys
     state_dict = ckpt.get("model", ckpt.get("model_state_dict", ckpt))
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
     if missing:
-        print(f"  Missing keys  : {missing}")
+        print(f"  Missing    : {missing}")
     if unexpected:
-        print(f"  Unexpected keys: {unexpected}")
+        print(f"  Unexpected : {unexpected}")
     model.eval()
 
     video_ids = args.videos or list(cfg.data.val_videos)
     print(f"\nEvaluating on videos: {video_ids}\n")
 
-    # ── Normal inference ──────────────────────────────────────────────────────
-    normal = evaluate_videos(model, video_ids, cfg, device,
-                             ablate_visual=False, label="NORMAL ")
-
-    # ── Ablated inference (visual tokens → zeros) ─────────────────────────────
-    ablated = evaluate_videos(model, video_ids, cfg, device,
-                              ablate_visual=True,  label="ABLATED")
+    results = {}
+    for label, flags in ABLATION_CONDITIONS:
+        print(f"\n── {label} ──")
+        results[label] = evaluate(model, video_ids, cfg, device, flags, label)
 
     # ── Report ────────────────────────────────────────────────────────────────
-    print("\n" + "=" * 60)
-    print(f"{'Metric':<14} {'Normal':>10} {'Ablated (vis=0)':>16} {'Δ (N-A)':>10}")
-    print("-" * 60)
-    for k in ["acc", "precision", "recall", "jaccard"]:
-        delta = normal[k] - ablated[k]
-        print(f"{k:<14} {normal[k]:>10.4f} {ablated[k]:>16.4f} {delta:>+10.4f}")
-    print("=" * 60)
+    baseline_acc = results["FULL (baseline)"]["acc"]
 
-    if normal["acc"] - ablated["acc"] > 0.02:
-        print("\n✓ Visual tokens ARE being used by the LLM "
-              f"(+{(normal['acc'] - ablated['acc'])*100:.1f}% acc drop when zeroed).")
-    elif normal["acc"] - ablated["acc"] > 0:
-        print("\n~ Marginal visual token contribution "
-              f"({(normal['acc'] - ablated['acc'])*100:.1f}% acc drop).")
-    else:
-        print("\n✗ Visual tokens do NOT seem to contribute "
-              "(no accuracy drop when zeroed — potential alignment issue).")
+    print("\n" + "=" * 72)
+    print(f"{'Condition':<20} {'Acc':>8} {'Prec':>8} {'Rec':>8} {'Jac':>8} {'ΔAcc':>8}")
+    print("-" * 72)
+    for label, _ in ABLATION_CONDITIONS:
+        m = results[label]
+        delta = m["acc"] - baseline_acc
+        flag  = "  (baseline)" if label == "FULL (baseline)" else f"  {delta:+.4f}"
+        print(f"{label:<20} {m['acc']:>8.4f} {m['precision']:>8.4f} "
+              f"{m['recall']:>8.4f} {m['jaccard']:>8.4f}{flag}")
+    print("=" * 72)
+
+    print("\nInterpretation (ΔAcc = ablated − baseline, negative = component helps):")
+    for label, _ in ABLATION_CONDITIONS[1:]:
+        delta = results[label]["acc"] - baseline_acc
+        pct   = abs(delta) * 100
+        if delta < -0.02:
+            verdict = f"✓  contributes  ({pct:.1f}% drop)"
+        elif delta < 0:
+            verdict = f"~  marginal     ({pct:.1f}% drop)"
+        else:
+            verdict = f"✗  not used     ({pct:.1f}% change)"
+        print(f"  {label:<18}: {verdict}")
 
 
 if __name__ == "__main__":
