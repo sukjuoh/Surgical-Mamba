@@ -89,6 +89,7 @@ def run_inference(model, video_id, cfg, device, ablate_flags: dict):
             prompt_kv   = prompt_kv,
             **ablate_flags,
         )
+        memory = memory.detach() if memory is not None else None
 
         mask_sq = valid_mask[0]
         all_logits.append(logits[0][mask_sq].cpu())

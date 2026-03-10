@@ -3,7 +3,7 @@
 # ============================================================
 
 model:
-  llm_model_name: "HuggingFaceTB/SmolLM2-360M"  # HuggingFace model ID (hidden_size=896)
+  llm_model_name: "Qwen/Qwen2.5-0.5B"  # HuggingFace model ID (hidden_size=896)
   num_phases: 7                           # CholecT80: 7 surgical phases
   visual_backbone: "vmamba"                         # "vmamba" | "clip"
   vmamba_pretrained: "./pretrained/vssmtiny.pth"  # VMamba-Tiny ImageNet pretrained (vmamba only)
@@ -29,9 +29,9 @@ model:
   # input. Replaces raw hidden-state truncation; memory size = n_hints tokens.
 
   # ── Local context compressor ──────────────────────────────────────────────
-  # Previous clip's visual_tokens averaged every 'ratio' frames → T//ratio
-  # tokens prepended to LLM input as dense local context.
-  local_context_ratio: 4            # temporal downsampling factor (4 → T//4 tokens)
+  # Last T//ratio frames of the previous clip, prepended as local context.
+  # Provides the most recent visual context bridging into the current clip.
+  local_context_ratio: 4            # keep last 1/ratio frames (4 → last T//4 frames)
 
   # ── Trainable layers ──────────────────────────────────────────────────────
   # LLM options (pick one):
@@ -48,7 +48,7 @@ model:
   lora_target_modules: null        # null→["q_proj","v_proj"] | ["q_proj","k_proj","v_proj"]
 
   # VMamba: 0=frozen | N>0=last N stages | 4=full finetune (VMamba-Tiny has 4 stages)
-  vmamba_trainable_stages: 1
+  vmamba_trainable_stages: 4
   # CLIP (visual_backbone="clip" only): 0=frozen | N>0=last N ViT layers | 24=full
   clip_trainable_layers: 0
 
@@ -141,6 +141,7 @@ train:
   lora_lr_factor: 0.1              # LoRA adapter lr = lr × factor (lower to preserve pretrained weights)
   weight_decay: 0.01
   grad_clip: 1.0
+  tbptt_k: 4                       # TBPTT window: gradient flows across K clips before detach
 
   # ── Loss weights ──────────────────────────────────────────────────────────
   label_smoothing: 0.1   # CE label smoothing (0.1 = soft targets)

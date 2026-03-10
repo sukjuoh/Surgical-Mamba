@@ -135,6 +135,7 @@ def extract_attentions_video(model, video_id, cfg, device):
             output_attentions=True,
         )
         _, memory, prev_visual, _, _, attentions, regions = out
+        memory = memory.detach() if memory is not None else None
         last_regions = regions
         T_actual = frames.shape[1]
         total_len = attentions[0].shape[-1]

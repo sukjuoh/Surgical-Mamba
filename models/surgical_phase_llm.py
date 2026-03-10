@@ -409,6 +409,14 @@ class SurgicalPhaseLLM(nn.Module):
         init_scale = target_norm / (self.d_llm ** 0.5)
         self.visual_scale = nn.Parameter(torch.tensor(init_scale))
 
+        # ── Frame position embedding ──────────────────────────────────────────
+        # RoPE encodes a token's position within the full LLM sequence, not its
+        # clip-relative frame index. This learnable embedding explicitly tells
+        # each visual token "you are frame t of T in the current clip."
+        # Initialized small so it doesn't disrupt the pretrained visual signal.
+        self.frame_pos_emb = nn.Embedding(512, self.d_llm)
+        nn.init.normal_(self.frame_pos_emb.weight, std=0.01)
+
         # ── 5. Clip hint encoder ─────────────────────────────────────────────
         # Initialize hint queries from LLM embeddings of phase/tool names so
         # each query starts "looking for" a specific surgical concept rather
@@ -614,6 +622,12 @@ class SurgicalPhaseLLM(nn.Module):
         # not discount visual tokens due to scale mismatch.
         visual_tokens = visual_tokens * self.visual_scale              # (B, T, d_llm)
 
+        # Inject clip-relative frame position: token t knows it is frame t of T.
+        # RoPE alone encodes position within the full LLM sequence (prompt + prefix + t),
+        # not the clip-relative index — this fills that gap.
+        frame_idx = torch.arange(T, device=frames.device)
+        visual_tokens = visual_tokens + self.frame_pos_emb(frame_idx).unsqueeze(0)  # (B, T, d_llm)
+
         # 4. Clip hint tokens ─────────────────────────────────────────────────
         hints, attn_focus_loss = self.hint_encoder(feats)               # (B, N_hints, d_llm)
 
@@ -706,13 +720,13 @@ class SurgicalPhaseLLM(nn.Module):
             shifted = {k: (s + prompt_len, e + prompt_len) for k, (s, e) in regions.items()}
             shifted["prompt"] = (0, prompt_len)
             return (
-                logits, new_memory.detach(), visual_tokens.detach(),
+                logits, new_memory, visual_tokens.detach(),
                 hints, attn_focus_loss,
                 lm_out.attentions, shifted,   # attentions + region map
             )
 
         return (
-            logits, new_memory.detach(), visual_tokens.detach(),
+            logits, new_memory, visual_tokens.detach(),
             hints, attn_focus_loss,
         )
 

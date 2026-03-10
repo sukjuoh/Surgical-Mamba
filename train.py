@@ -205,6 +205,7 @@ def run_video_inference(
             prev_visual = prev_visual,
             prompt_kv   = prompt_kv,
         )
+        memory = memory.detach() if memory is not None else None
 
         # Collect only valid frames (B=1, so squeeze)
         mask_sq  = valid_mask[0]              # (T,)
@@ -306,9 +307,29 @@ def evaluate_test(model: SurgicalPhaseLLM, cfg, device: torch.device, epoch: int
 
 
 def build_optimizer(model: SurgicalPhaseLLM, cfg):
-    trainable = [p for p in model.parameters() if p.requires_grad]
+    lr = cfg.train.lr
+    wd = cfg.train.weight_decay
+    lora_factor = cfg.train.get("lora_lr_factor", 1.0)
+
+    use_lora = cfg.model.get("use_lora", False)
+    if use_lora and lora_factor != 1.0:
+        lora_params  = [p for n, p in model.named_parameters()
+                        if p.requires_grad and ("lora_A" in n or "lora_B" in n)]
+        other_params = [p for n, p in model.named_parameters()
+                        if p.requires_grad and ("lora_A" not in n and "lora_B" not in n)]
+        param_groups = [
+            {"params": other_params, "lr": lr},
+            {"params": lora_params,  "lr": lr * lora_factor},
+        ]
+        print(f"[optimizer] LoRA lr={lr * lora_factor:.2e} ({lora_factor}×), "
+              f"other lr={lr:.2e}  "
+              f"| LoRA params={sum(p.numel() for p in lora_params):,}, "
+              f"other params={sum(p.numel() for p in other_params):,}")
+    else:
+        param_groups = [p for p in model.parameters() if p.requires_grad]
+
     if cfg.train.optimizer.lower() == "adamw":
-        return torch.optim.AdamW(trainable, lr=cfg.train.lr, weight_decay=cfg.train.weight_decay)
+        return torch.optim.AdamW(param_groups, lr=lr, weight_decay=wd)
     raise ValueError(f"Unknown optimizer: {cfg.train.optimizer}")
 
 
@@ -371,16 +392,30 @@ def run_video(
     phase_correct = defaultdict(int)
     phase_total   = defaultdict(int)
 
-    # When LLM layers are trainable, prompt_kv must be rebuilt each clip
+    # When LLM layers are trainable, prompt_kv must be rebuilt each window
     # (weights change after each optimizer step, cached KV would be stale).
     # When LLM is fully frozen, build once per video for efficiency.
     llm_is_trainable = any(p.requires_grad for p in model.llm.parameters())
     prompt_kv_static = None if (is_train and llm_is_trainable) else model.build_prompt_kv()
 
+    # TBPTT: K clips per window — gradient flows within window, detach at boundary.
+    # tbptt_k=1 → same as original (detach every clip).
+    tbptt_k = cfg.train.get("tbptt_k", 1) if is_train else 1
+
     memory      = None  # CrossClipMemory global state, reset per video
     prev_visual = None  # Previous clip's visual_tokens, reset per video
 
-    for frames, tools, labels, valid_mask in loader:
+    # TBPTT window state
+    window_loss  = None   # accumulated loss tensor (keeps graph alive)
+    window_clips = 0      # clips accumulated in current window
+    clips = list(loader)
+    n_clips = len(clips)
+
+    if is_train:
+        optimizer.zero_grad()
+        prompt_kv = model.build_prompt_kv() if llm_is_trainable else prompt_kv_static
+
+    for clip_idx, (frames, tools, labels, valid_mask) in enumerate(clips):
         # frames:     (1, T, 3, H, W)
         # tools:      (1, T, 7)
         # labels:     (1, T)
@@ -390,11 +425,7 @@ def run_video(
         labels     = labels.to(device)
         valid_mask = valid_mask.to(device)
 
-        if is_train:
-            optimizer.zero_grad()
-            # Rebuild prompt KV each clip if LLM weights are being updated
-            prompt_kv = model.build_prompt_kv() if llm_is_trainable else prompt_kv_static
-        else:
+        if not is_train:
             prompt_kv = prompt_kv_static
 
         with torch.set_grad_enabled(is_train):
@@ -416,22 +447,41 @@ def run_video(
                         + cfg.train.w_attn_focus * attn_loss)
 
         if is_train:
-            if scaler is not None:
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-                if cfg.train.grad_clip > 0:
-                    nn.utils.clip_grad_norm_(model.parameters(), cfg.train.grad_clip)
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                loss.backward()
-                if cfg.train.grad_clip > 0:
-                    nn.utils.clip_grad_norm_(model.parameters(), cfg.train.grad_clip)
-                optimizer.step()
-            if scheduler is not None:
-                scheduler.step()
+            window_loss   = loss if window_loss is None else window_loss + loss
+            window_clips += 1
+            is_last_clip  = (clip_idx == n_clips - 1)
+            is_window_end = (window_clips >= tbptt_k) or is_last_clip
 
-        # Accumulate metrics
+            if is_window_end:
+                avg_loss = window_loss / window_clips
+                if scaler is not None:
+                    scaler.scale(avg_loss).backward()
+                    scaler.unscale_(optimizer)
+                    if cfg.train.grad_clip > 0:
+                        nn.utils.clip_grad_norm_(model.parameters(), cfg.train.grad_clip)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    avg_loss.backward()
+                    if cfg.train.grad_clip > 0:
+                        nn.utils.clip_grad_norm_(model.parameters(), cfg.train.grad_clip)
+                    optimizer.step()
+                if scheduler is not None:
+                    scheduler.step()
+
+                # Detach memory at window boundary so next window starts fresh
+                if memory is not None:
+                    memory = memory.detach()
+
+                optimizer.zero_grad()
+                # Rebuild prompt KV after optimizer step (LoRA weights updated)
+                if llm_is_trainable and not is_last_clip:
+                    prompt_kv = model.build_prompt_kv()
+
+                window_loss  = None
+                window_clips = 0
+
+        # Accumulate metrics (detach for safety)
         total_loss        += loss.item()
         total_loss_ce     += loss_ce.item()
         total_loss_smooth += loss_smooth.item()

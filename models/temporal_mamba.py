@@ -187,14 +187,14 @@ class CrossClipMemory(nn.Module):
 
 class LocalContextCompressor(nn.Module):
     """
-    Compresses the previous clip's visual tokens to 1/ratio of their temporal length
-    via average pooling. No learnable parameters — visual_tokens are already
-    well-refined (VMamba + TemporalRefiner + Reprogramming), so averaging suffices.
+    Returns the last T//ratio frames of the previous clip's visual tokens.
+    Provides the most recent local context — the tail of the previous clip
+    directly bridges into the current clip temporally.
 
     (B, T, d_model) → (B, T//ratio, d_model)
 
     Args:
-        ratio:  temporal downsampling factor (default 4 → T//4 output tokens)
+        ratio:  keep last 1/ratio frames (default 4 → last T//4 frames)
     """
 
     def __init__(self, ratio: int = 4):
@@ -203,11 +203,9 @@ class LocalContextCompressor(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: (B, T, d_model) → (B, T//ratio, d_model)"""
-        B, T, d = x.shape
-        pad = (self.ratio - T % self.ratio) % self.ratio
-        if pad > 0:
-            x = F.pad(x, (0, 0, 0, pad))
-        return x.reshape(B, x.shape[1] // self.ratio, self.ratio, d).mean(dim=2)
+        T = x.shape[1]
+        keep = max(T // self.ratio, 1)
+        return x[:, -keep:, :]
 
 
 class TemporalRefiner(nn.Module):
