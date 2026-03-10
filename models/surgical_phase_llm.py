@@ -512,7 +512,7 @@ class SurgicalPhaseLLM(nn.Module):
     # ── Per-segment tool text embedding ──────────────────────────────────────
 
     @torch.no_grad()
-    def _make_tool_emb(self, tool_annots: torch.Tensor) -> torch.Tensor:
+    def _make_tool_emb(self, tool_annots: torch.Tensor, clip_idx: int = 0) -> torch.Tensor:
         """
         Build per-segment tool text embeddings for the current clip.
 
@@ -521,9 +521,11 @@ class SurgicalPhaseLLM(nn.Module):
         which tools were active. This gives the LLM fine-grained temporal
         information about tool usage (e.g. "frames 0-31: Grasper; frames
         32-63: Hook, Clipper"), which correlates strongly with phase.
+        clip_idx is prepended so the LLM knows how far into the video we are.
 
         Args:
             tool_annots: (B, T, 7) binary/float tool presence per frame
+            clip_idx:    0-based index of the current clip in the video
 
         Returns:
             tool_emb: (B, L_tool, d_llm)
@@ -546,7 +548,7 @@ class SurgicalPhaseLLM(nn.Module):
                 tool_str = f"frames {start}-{end-1}: " + (", ".join(active) if active else "none")
                 parts.append(tool_str)
 
-            full_str = "Tool context: " + "; ".join(parts) + "."
+            full_str = f"Clip {clip_idx}. Tool context: " + "; ".join(parts) + "."
             ids = self.tokenizer(
                 full_str, return_tensors="pt", truncation=True, max_length=128
             ).input_ids.to(device)
@@ -567,6 +569,7 @@ class SurgicalPhaseLLM(nn.Module):
         memory: torch.Tensor = None,
         prev_visual: torch.Tensor = None,
         prompt_kv: tuple = None,
+        clip_idx: int = 0,
         ablate_visual: bool = False,
         ablate_hints: bool = False,
         ablate_tool: bool = False,
@@ -666,7 +669,7 @@ class SurgicalPhaseLLM(nn.Module):
         _add("hints", hints_in.to(llm_dtype))
 
         if not ablate_tool and tool_annots is not None:
-            _add("tool", self._make_tool_emb(tool_annots))
+            _add("tool", self._make_tool_emb(tool_annots, clip_idx=clip_idx))
 
         if not ablate_prev and prev_visual is not None:
             _add("prev_hdr", _seg(self.seg_prev_emb))

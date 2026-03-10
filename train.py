@@ -192,7 +192,7 @@ def run_video_inference(
     all_logits = []
     all_labels = []
 
-    for frames, tools, labels, valid_mask in loader:
+    for clip_idx, (frames, tools, labels, valid_mask) in enumerate(loader):
         frames     = frames.to(device)
         tools      = tools.to(device)
         labels     = labels.to(device)
@@ -204,6 +204,7 @@ def run_video_inference(
             memory      = memory,
             prev_visual = prev_visual,
             prompt_kv   = prompt_kv,
+            clip_idx    = clip_idx,
         )
         memory = memory.detach() if memory is not None else None
 
@@ -436,6 +437,7 @@ def run_video(
                     memory      = memory,
                     prev_visual = prev_visual,
                     prompt_kv   = prompt_kv,
+                    clip_idx    = clip_idx,
                 )
                 loss_ce     = masked_ce_loss(logits, labels, valid_mask,
                                              label_smoothing=cfg.train.label_smoothing)
