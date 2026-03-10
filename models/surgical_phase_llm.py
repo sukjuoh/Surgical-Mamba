@@ -402,13 +402,14 @@ class SurgicalPhaseLLM(nn.Module):
         # or over-weight visual tokens relative to text tokens.
         # Solution: a single learnable scalar initialized so that
         #   avg(visual_token_norm) ≈ avg(LLM_embedding_norm)
+        '''
         with torch.no_grad():
             emb_norms = word_emb_weight.norm(dim=-1).float()  # (V,)
             target_norm = emb_norms.mean().item()
         # LayerNorm output has norm ≈ sqrt(d_llm); scale to match LLM embedding norm
         init_scale = target_norm / (self.d_llm ** 0.5)
         self.visual_scale = nn.Parameter(torch.tensor(init_scale))
-
+        '''
         # ── Frame position embedding ──────────────────────────────────────────
         # RoPE encodes a token's position within the full LLM sequence, not its
         # clip-relative frame index. This learnable embedding explicitly tells
@@ -620,7 +621,8 @@ class SurgicalPhaseLLM(nn.Module):
         visual_tokens = self.visual_norm2(fused + self.visual_ffn(fused))  # (B, T, d_llm)
         # Align visual token norms with LLM embedding norms so the LLM does
         # not discount visual tokens due to scale mismatch.
-        visual_tokens = visual_tokens * self.visual_scale              # (B, T, d_llm)
+        
+        #visual_tokens = visual_tokens * self.visual_scale              # (B, T, d_llm)
 
         # Inject clip-relative frame position: token t knows it is frame t of T.
         # RoPE alone encodes position within the full LLM sequence (prompt + prefix + t),
