@@ -85,6 +85,14 @@ _DEFAULT_PROMPT = (
     "Phase 4 - GallbladderPackaging: placement of the gallbladder into a retrieval bag. "
     "Phase 5 - CleaningCoagulation: irrigation, cleaning, and coagulation of the surgical site. "
     "Phase 6 - GallbladderRetraction: retraction and extraction of the gallbladder. "
+    "The 7 surgical tools used in this procedure are: "
+    "Grasper: grasps and retracts tissue to expose the surgical field. "
+    "Bipolar: applies bipolar electrical current for hemostasis and coagulation. "
+    "Hook: dissects and coagulates tissue using a hook-shaped electrosurgical tip. "
+    "Scissors: cuts tissue and structures during dissection. "
+    "Clipper: applies metal clips to seal the cystic duct and cystic artery before cutting. "
+    "Irrigator: irrigates the surgical field with saline and aspirates fluid. "
+    "SpecimenBag: a retrieval bag used to contain the gallbladder for safe extraction. "
     "<|end_prompt|>"
 )
 
@@ -321,12 +329,6 @@ class SurgicalPhaseLLM(nn.Module):
             num_layers=mamba_layers,
         )
 
-        # ── 2b. Frame-level auxiliary head ───────────────────────────────────
-        # A single linear layer directly on TemporalRefiner output (d_visual→num_phases).
-        # Forces the frame branch to learn phase-discriminative representations
-        # independently of the LLM, analogous to the frame branch auxiliary loss
-        # in dual-branch surgical phase recognition architectures.
-        self.frame_aux_head = nn.Linear(self.d_visual, num_phases)
 
         # ── 3. LLM ───────────────────────────────────────────────────────────
         self.tokenizer = AutoTokenizer.from_pretrained(llm_model_name)
@@ -621,9 +623,6 @@ class SurgicalPhaseLLM(nn.Module):
         # Captures temporal dependencies across the clip before LLM projection
         feats = self.temporal_refiner(feats)                           # (B, T, d_visual)
 
-        # 2b. Frame-level auxiliary prediction (before LLM projection)
-        frame_aux_logits = self.frame_aux_head(feats)                  # (B, T, num_phases)
-
         # 3. Visual projector (transformer block style) ───────────────────────
         direct   = self.linear_proj(feats)                             # (B, T, d_llm)
         if self.use_mapping_layer:
@@ -782,13 +781,13 @@ class SurgicalPhaseLLM(nn.Module):
             shifted = {k: (s + prompt_len, e + prompt_len) for k, (s, e) in regions.items()}
             shifted["prompt"] = (0, prompt_len)
             return (
-                logits, tool_logits, frame_aux_logits, new_memory, visual_tokens.detach(),
+                logits, tool_logits, new_memory, visual_tokens.detach(),
                 hints, attn_focus_loss,
                 lm_out.attentions, shifted,
             )
 
         return (
-            logits, tool_logits, frame_aux_logits, new_memory, visual_tokens.detach(),
+            logits, tool_logits, new_memory, visual_tokens.detach(),
             hints, attn_focus_loss,
         )
 
@@ -798,7 +797,7 @@ class SurgicalPhaseLLM(nn.Module):
         """Single-clip forward without temporal context (for quick testing)."""
         if self._prompt_kv is None:
             self.build_prompt_kv()
-        logits, _, _, _, _, _, _ = self.forward_clip(frames, tool_annots=tool_annots)
+        logits, _, _, _, _, _ = self.forward_clip(frames, tool_annots=tool_annots)
         return logits
 
     # ── Config factory ───────────────────────────────────────────────────────

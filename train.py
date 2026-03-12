@@ -531,7 +531,7 @@ def run_video(
     total_loss_div    = 0.0
     total_loss_attn   = 0.0
     total_loss_tool   = 0.0
-    total_loss_frame  = 0.0
+
     total_correct = 0
     total_frames  = 0
     phase_correct = defaultdict(int)
@@ -580,7 +580,7 @@ def run_video(
 
         with torch.set_grad_enabled(is_train):
             with autocast("cuda", enabled=(scaler is not None)):
-                logits, tool_logits, frame_aux_logits, memory, prev_visual, hints, attn_loss = model.forward_clip(
+                logits, tool_logits, memory, prev_visual, hints, attn_loss = model.forward_clip(
                     frames      = frames,
                     tool_annots = tools,
                     memory      = memory,
@@ -593,14 +593,11 @@ def run_video(
                 loss_div    = hint_diversity_loss(hints)
                 loss_tool   = (tool_aux_loss(tool_logits, tools, valid_mask)
                                if model.use_tool else loss_ce.new_tensor(0.0))
-                loss_frame  = masked_ce_loss(frame_aux_logits, labels, valid_mask,
-                                             label_smoothing=cfg.train.label_smoothing)
                 loss = (loss_ce
                         + cfg.train.w_smooth     * loss_smooth
                         + cfg.train.w_diversity  * loss_div
                         + cfg.train.w_attn_focus * attn_loss
-                        + cfg.train.w_tool       * loss_tool
-                        + cfg.train.w_frame      * loss_frame)
+                        + cfg.train.w_tool       * loss_tool)
 
         if is_train:
             window_loss   = loss if window_loss is None else window_loss + loss
@@ -645,7 +642,6 @@ def run_video(
         total_loss_div    += loss_div.item()
         total_loss_attn   += attn_loss.item()
         total_loss_tool   += loss_tool.item()
-        total_loss_frame  += loss_frame.item()
         correct, total = compute_accuracy(logits, labels, valid_mask)
         total_correct += correct
         total_frames  += total
@@ -670,7 +666,6 @@ def run_video(
         "loss_div":    total_loss_div    / num_clips,
         "loss_attn":   total_loss_attn   / num_clips,
         "loss_tool":   total_loss_tool   / num_clips,
-        "loss_frame":  total_loss_frame  / num_clips,
         "correct":       total_correct,
         "total":         total_frames,
         "phase_correct": phase_correct,
@@ -736,7 +731,6 @@ def main():
         epoch_loss_div    = 0.0
         epoch_loss_attn   = 0.0
         epoch_loss_tool   = 0.0
-        epoch_loss_frame  = 0.0
         epoch_correct = 0
         epoch_total   = 0
         epoch_phase_correct = defaultdict(int)
@@ -756,7 +750,6 @@ def main():
             epoch_loss_div    += result["loss_div"]
             epoch_loss_attn   += result["loss_attn"]
             epoch_loss_tool   += result["loss_tool"]
-            epoch_loss_frame  += result["loss_frame"]
             epoch_correct += result["correct"]
             epoch_total   += result["total"]
             for ph in range(cfg.data.num_phases):
@@ -784,7 +777,6 @@ def main():
         train_loss_div    = epoch_loss_div    / n_vid
         train_loss_attn   = epoch_loss_attn   / n_vid
         train_loss_tool   = epoch_loss_tool   / n_vid
-        train_loss_frame  = epoch_loss_frame  / n_vid
 
         wandb.log({
             "train/loss":        train_loss,
@@ -793,7 +785,6 @@ def main():
             "train/loss_div":    train_loss_div,
             "train/loss_attn":   train_loss_attn,
             "train/loss_tool":   train_loss_tool,
-            "train/loss_frame":  train_loss_frame,
             "train/accuracy":    train_acc,
             "epoch":             epoch,
         })
@@ -801,7 +792,7 @@ def main():
         print(f"\n=== Epoch {epoch} Train | loss {train_loss:.4f} "
               f"(ce={train_loss_ce:.3f} sm={train_loss_smooth:.3f} "
               f"div={train_loss_div:.3f} attn={train_loss_attn:.3f} "
-              f"tool={train_loss_tool:.3f} frame={train_loss_frame:.3f})"
+              f"tool={train_loss_tool:.3f} "
               f" | acc {train_acc:.4f} ===")
 
         # ── Test evaluation every epoch ───────────────────────────────────────

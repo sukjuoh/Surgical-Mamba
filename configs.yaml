@@ -160,7 +160,7 @@ train:
   w_diversity:     0.1   # hint diversity loss weight
   w_attn_focus:    0.1  # hint attention focus loss weight
   w_tool:          0.1   # auxiliary tool prediction loss weight (multi-label BCE)
-  w_frame:         0.3   # frame-level auxiliary phase loss (Linear on TemporalRefiner output)
+
 
   # Learning rate scheduler
   scheduler: "cosine"              # "cosine" | "step" | null
