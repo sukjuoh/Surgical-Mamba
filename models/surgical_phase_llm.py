@@ -4,6 +4,7 @@ Surgical Phase Recognition via LLM Reprogramming.
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from omegaconf import DictConfig
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 
@@ -37,6 +38,7 @@ CHOLEC80_TOOLS = [
 # ── Prompt prefix (static, KV-cached) ────────────────────────────────────────
 # Describes dataset context, phase semantics, and tool semantics.
 # Does NOT describe input structure — section headers below do that inline.
+'''
 _DEFAULT_PROMPT = (
     "<|start_prompt|>"
     "Dataset description: Laparoscopic cholecystectomy surgical video recorded at 1 fps. "
@@ -68,6 +70,24 @@ _DEFAULT_PROMPT = (
     "Phase 6 - GallbladderRetraction: Grasper, SpecimenBag. "
     "<|end_prompt|>"
 )
+'''
+
+_DEFAULT_PROMPT = (
+    "<|start_prompt|>"
+    "Dataset description: Laparoscopic cholecystectomy surgical video recorded at 1 fps. "
+    "Task description: Recognize the surgical phase label for each video frame token "
+    "given the sequence of visual feature tokens. "
+    "Phase 0 - Preparation: initial setup and trocar insertion before the procedure begins. "
+    "Phase 1 - CalotTriangleDissection: dissection of peritoneum around the Calot triangle "
+    "to expose the cystic duct and artery. "
+    "Phase 2 - ClippingCutting: application of clips and cutting of the cystic duct and artery. "
+    "Phase 3 - GallbladderDissection: dissection of the gallbladder from the liver bed. "
+    "Phase 4 - GallbladderPackaging: placement of the gallbladder into a retrieval bag. "
+    "Phase 5 - CleaningCoagulation: irrigation, cleaning, and coagulation of the surgical site. "
+    "Phase 6 - GallbladderRetraction: retraction and extraction of the gallbladder. "
+    "<|end_prompt|>"
+)
+
 
 # ── Section headers (static, pre-embedded as buffers) ────────────────────────
 # Each header is placed immediately before its corresponding token group,
@@ -75,10 +95,8 @@ _DEFAULT_PROMPT = (
 _SEG_MEMORY = "The following tokens summarise the global surgical context from all previous clips:"
 _SEG_HINTS  = "The following tokens are visual summary tokens for the current clip:"
 _SEG_PREV   = "The following tokens are a compressed representation of the previous clip:"
+_SEG_TOOL   = "The following tokens represent the surgical tools present in the current clip:"
 _SEG_VISUAL = "The following tokens are per-frame visual feature tokens for the current clip:"
-
-# Number of temporal segments for per-segment tool text
-_N_TOOL_SEGMENTS = 4
 
 # ── Surgical/medical domain vocabulary for reprogramming token selection ──────
 # Used to select semantically relevant LLM tokens as K/V bank for the
@@ -247,7 +265,10 @@ class SurgicalPhaseLLM(nn.Module):
         d_ff: int = 256,
         num_tokens: int = 1000,
         n_hints: int = 8,
+        use_prev_clip: bool = True,
         local_context_ratio: int = 4,
+        use_tool: bool = True,
+        tool_pred_layer: int = None,
         prompt: str = _DEFAULT_PROMPT,
         attention_dropout: float = 0.1,
         hint_dropout: float = 0.1,
@@ -299,6 +320,13 @@ class SurgicalPhaseLLM(nn.Module):
             d_model=self.d_visual,
             num_layers=mamba_layers,
         )
+
+        # ── 2b. Frame-level auxiliary head ───────────────────────────────────
+        # A single linear layer directly on TemporalRefiner output (d_visual→num_phases).
+        # Forces the frame branch to learn phase-discriminative representations
+        # independently of the LLM, analogous to the frame branch auxiliary loss
+        # in dual-branch surgical phase recognition architectures.
+        self.frame_aux_head = nn.Linear(self.d_visual, num_phases)
 
         # ── 3. LLM ───────────────────────────────────────────────────────────
         self.tokenizer = AutoTokenizer.from_pretrained(llm_model_name)
@@ -471,12 +499,48 @@ class SurgicalPhaseLLM(nn.Module):
         # LocalContextCompressor reduces the previous clip's visual tokens
         #   to T//4 tokens via average pooling, prepended after global memory.
         self.cross_clip_memory = CrossClipMemory(d_model=self.d_llm)
+        self.use_prev_clip = use_prev_clip
+        self.use_tool = use_tool
         self.local_compressor = LocalContextCompressor(ratio=local_context_ratio)
+        # None → use final layer (same as phase head); int N → use hidden_states[N]
+        # hidden_states[0] = embedding, hidden_states[N] = after (N-1)-th transformer layer
+        self.tool_pred_layer = tool_pred_layer
 
+        # ── 8. Tool presence tokens ───────────────────────────────────────────
+        # Indices 0-6: one learnable token per tool (present in clip).
+        # Index    7 : padding token (fills absent-tool slots).
+        # In forward_clip, present tools use their own token; absent tools use
+        # the pad token → always exactly 7 tokens in fixed tool order.
+        # Initialized from LLM embeddings of tool names (indices 0-6).
+        # Pad token (index 7) initialised near-zero.
+        embed_fn = self.llm.get_input_embeddings()
+        with torch.no_grad():
+            tool_inits = []
+            for name in CHOLEC80_TOOLS:
+                ids = self.tokenizer(name, add_special_tokens=False,
+                                     return_tensors="pt").input_ids
+                emb = embed_fn(ids).mean(dim=1).squeeze(0)    # (d_llm,)
+                tool_inits.append(emb)
+            tool_init_w = torch.stack(tool_inits, dim=0).float()  # (7, d_llm)
+        
+        if self.use_tool:
+            self.tool_emb = nn.Embedding(8, self.d_llm)           # 7 tools + 1 pad
+            with torch.no_grad():
+                self.tool_emb.weight[:7].copy_(tool_init_w)
+                nn.init.normal_(self.tool_emb.weight[7:], std=0.01)  # pad token
 
-        # ── 8. Output head ───────────────────────────────────────────────────
+        # Pre-embed tool section header
+        ids = self.tokenizer(_SEG_TOOL, return_tensors="pt").input_ids
+        with torch.no_grad():
+            emb = embed_fn(ids)                                # (1, L, d_llm)
+        self.register_buffer("seg_tool_emb", emb.detach())
+
+        # ── 9. Output heads ──────────────────────────────────────────────────
         self.output_dropout = nn.Dropout(output_dropout)
         self.output_head = nn.Linear(d_ff, num_phases)
+        # Tool classification uses dot-product similarity between
+        # tool token hidden states and visual token hidden states → no linear head.
+
 
     # ── Prompt KV cache ──────────────────────────────────────────────────────
 
@@ -509,57 +573,6 @@ class SurgicalPhaseLLM(nn.Module):
         self._prompt_kv = kv
         return self._prompt_kv
 
-    # ── Per-segment tool text embedding ──────────────────────────────────────
-
-    @torch.no_grad()
-    def _make_tool_emb(self, tool_annots: torch.Tensor, clip_idx: int = 0) -> torch.Tensor:
-        """
-        Build per-segment tool text embeddings for the current clip.
-
-        Instead of a single clip-level summary, the clip is divided into
-        _N_TOOL_SEGMENTS equal segments. For each segment, we describe
-        which tools were active. This gives the LLM fine-grained temporal
-        information about tool usage (e.g. "frames 0-31: Grasper; frames
-        32-63: Hook, Clipper"), which correlates strongly with phase.
-        clip_idx is prepended so the LLM knows how far into the video we are.
-
-        Args:
-            tool_annots: (B, T, 7) binary/float tool presence per frame
-            clip_idx:    0-based index of the current clip in the video
-
-        Returns:
-            tool_emb: (B, L_tool, d_llm)
-        """
-        device = tool_annots.device
-        B, T, _ = tool_annots.shape
-        embed_fn = self.llm.get_input_embeddings()
-        n_seg = _N_TOOL_SEGMENTS
-
-        embs = []
-        for b in range(B):
-            seg_size = max(T // n_seg, 1)
-            parts = []
-            for s in range(n_seg):
-                start = s * seg_size
-                end   = start + seg_size if s < n_seg - 1 else T
-                seg_tools = tool_annots[b, start:end, :]          # (seg_len, 7)
-                present = seg_tools.sum(dim=0) > 0                # (7,)
-                active = [name for name, flag in zip(CHOLEC80_TOOLS, present.tolist()) if flag]
-                tool_str = f"frames {start}-{end-1}: " + (", ".join(active) if active else "none")
-                parts.append(tool_str)
-
-            full_str = f"Clip {clip_idx}. Tool context: " + "; ".join(parts) + "."
-            ids = self.tokenizer(
-                full_str, return_tensors="pt", truncation=True, max_length=128
-            ).input_ids.to(device)
-            embs.append(embed_fn(ids))                            # (1, L, d_llm)
-
-        max_len = max(e.shape[1] for e in embs)
-        padded = torch.zeros(B, max_len, embs[0].shape[-1], device=device, dtype=embs[0].dtype)
-        for b, e in enumerate(embs):
-            padded[b, :e.shape[1]] = e[0]
-        return padded  # (B, L_tool, d_llm)
-
     # ── Per-clip forward ─────────────────────────────────────────────────────
 
     def forward_clip(
@@ -569,7 +582,6 @@ class SurgicalPhaseLLM(nn.Module):
         memory: torch.Tensor = None,
         prev_visual: torch.Tensor = None,
         prompt_kv: tuple = None,
-        clip_idx: int = 0,
         ablate_visual: bool = False,
         ablate_hints: bool = False,
         ablate_tool: bool = False,
@@ -608,6 +620,9 @@ class SurgicalPhaseLLM(nn.Module):
         # 2. Mamba temporal refinement ────────────────────────────────────────
         # Captures temporal dependencies across the clip before LLM projection
         feats = self.temporal_refiner(feats)                           # (B, T, d_visual)
+
+        # 2b. Frame-level auxiliary prediction (before LLM projection)
+        frame_aux_logits = self.frame_aux_head(feats)                  # (B, T, num_phases)
 
         # 3. Visual projector (transformer block style) ───────────────────────
         direct   = self.linear_proj(feats)                             # (B, T, d_llm)
@@ -668,12 +683,21 @@ class SurgicalPhaseLLM(nn.Module):
         hints_in = torch.zeros_like(hints) if ablate_hints else hints
         _add("hints", hints_in.to(llm_dtype))
 
-        if not ablate_tool and tool_annots is not None:
-            _add("tool", self._make_tool_emb(tool_annots, clip_idx=clip_idx))
-
-        if not ablate_prev and prev_visual is not None:
+        if self.use_prev_clip and not ablate_prev and prev_visual is not None:
             _add("prev_hdr", _seg(self.seg_prev_emb))
             _add("prev",     self.local_compressor(prev_visual).to(llm_dtype))
+
+        if self.use_tool and not ablate_tool and tool_annots is not None:
+            # 7 tool tokens in fixed order (one per tool).
+            # Present tools use their own learned token; absent tools use the pad
+            # token (index 7).  Sequence length is always exactly 7.
+            present   = (tool_annots.sum(dim=1) > 0)                  # (B, 7) bool
+            tool_idx  = torch.arange(7, device=frames.device)
+            select    = torch.where(present, tool_idx.unsqueeze(0),
+                                    tool_idx.new_full((1, 7), 7))      # (B, 7)
+            tool_toks = self.tool_emb(select).to(llm_dtype)            # (B, 7, d_llm)
+            _add("tool_hdr", _seg(self.seg_tool_emb))
+            _add("tool",     tool_toks)
 
         _add("visual_hdr", _seg(self.seg_visual_emb))
         vt = torch.zeros_like(visual_tokens) if ablate_visual else visual_tokens
@@ -682,7 +706,12 @@ class SurgicalPhaseLLM(nn.Module):
         llm_input = torch.cat(parts, dim=1)  # (B, *, d_llm)
 
         # 6. LLM forward ──────────────────────────────────────────────────────
-        prompt_len = 0
+        # hidden_offset: index of the first llm_input token in lm_out.hidden_states.
+        # In KV-cache mode the past tokens are not in hidden_states → offset = 0.
+        # In fallback (no KV cache) the prompt prefix is prepended to the input →
+        # hidden_states covers [prefix | llm_input] → offset = prefix length.
+        prompt_len    = 0
+        hidden_offset = 0
         if ablate_prompt:
             lm_out = self.llm(
                 inputs_embeds=llm_input,
@@ -691,7 +720,7 @@ class SurgicalPhaseLLM(nn.Module):
                 output_attentions=output_attentions,
             )
         elif prompt_kv is not None:
-            prompt_len = self.prompt_len
+            prompt_len = self.prompt_len   # used only for shifted region map
             kv_cache = (
                 DynamicCache.from_legacy_cache(prompt_kv)
                 if isinstance(prompt_kv, tuple)
@@ -707,7 +736,8 @@ class SurgicalPhaseLLM(nn.Module):
         else:
             # LoRA mode: prepend prompt embeddings directly each clip.
             prefix = self.prompt_emb.expand(B, -1, -1).to(llm_dtype)
-            prompt_len = prefix.shape[1]
+            prompt_len    = prefix.shape[1]
+            hidden_offset = prompt_len
             full_input = torch.cat([prefix, llm_input], dim=1)
             lm_out = self.llm(
                 inputs_embeds=full_input,
@@ -716,22 +746,49 @@ class SurgicalPhaseLLM(nn.Module):
                 output_attentions=output_attentions,
             )
 
-        # 7. Extract frame positions and predict ──────────────────────────────
-        final_hidden = lm_out.hidden_states[-1][:, -T:, :self.d_ff].float()
-        logits = self.output_head(self.output_dropout(final_hidden))  # (B, T, num_phases)
+        # 7. Extract visual / tool positions and predict ─────────────────────
+        def _get_visual_hidden(hidden_states):
+            s, e = regions["visual"]
+            return hidden_states[:, hidden_offset + s : hidden_offset + e, :]
+
+        def _get_tool_hidden(hidden_states):
+            s, e = regions["tool"]
+            return hidden_states[:, hidden_offset + s : hidden_offset + e, :]
+
+        final_hidden = _get_visual_hidden(lm_out.hidden_states[-1])[:, :, :self.d_ff].float()
+        dropped = self.output_dropout(final_hidden)
+        logits = self.output_head(dropped)        # (B, T, num_phases)
+
+        # Tool prediction: dot-product similarity between each tool token's hidden
+        # state and each visual frame's hidden state.
+        # tool_logits[b, t, i] = vis_feat[b,t] · tool_feat[b,i]  →  (B, T, 7)
+        # Falls back to zeros when tool tokens were ablated (no "tool" region).
+        if "tool" not in regions:
+            tool_logits = torch.zeros(B, T, 7, device=frames.device)
+        else:
+            if self.tool_pred_layer is not None:
+                vis_feat  = _get_visual_hidden(
+                    lm_out.hidden_states[self.tool_pred_layer])[:, :, :self.d_ff].float()
+                tool_feat = _get_tool_hidden(
+                    lm_out.hidden_states[self.tool_pred_layer])[:, :, :self.d_ff].float()
+            else:
+                vis_feat  = final_hidden                              # (B, T, d_ff)
+                tool_feat = _get_tool_hidden(
+                    lm_out.hidden_states[-1])[:, :, :self.d_ff].float()  # (B, 7, d_ff)
+            tool_logits = torch.bmm(vis_feat, tool_feat.transpose(1, 2))  # (B, T, 7)
 
         if output_attentions:
             # Shift region boundaries by prompt_len so they index into the full sequence
             shifted = {k: (s + prompt_len, e + prompt_len) for k, (s, e) in regions.items()}
             shifted["prompt"] = (0, prompt_len)
             return (
-                logits, new_memory, visual_tokens.detach(),
+                logits, tool_logits, frame_aux_logits, new_memory, visual_tokens.detach(),
                 hints, attn_focus_loss,
-                lm_out.attentions, shifted,   # attentions + region map
+                lm_out.attentions, shifted,
             )
 
         return (
-            logits, new_memory, visual_tokens.detach(),
+            logits, tool_logits, frame_aux_logits, new_memory, visual_tokens.detach(),
             hints, attn_focus_loss,
         )
 
@@ -741,7 +798,7 @@ class SurgicalPhaseLLM(nn.Module):
         """Single-clip forward without temporal context (for quick testing)."""
         if self._prompt_kv is None:
             self.build_prompt_kv()
-        logits, _, _, _, _ = self.forward_clip(frames, tool_annots=tool_annots)
+        logits, _, _, _, _, _, _ = self.forward_clip(frames, tool_annots=tool_annots)
         return logits
 
     # ── Config factory ───────────────────────────────────────────────────────
@@ -771,7 +828,10 @@ class SurgicalPhaseLLM(nn.Module):
             d_ff             = m.d_ff,
             num_tokens       = m.num_tokens,
             n_hints          = m.n_hints,
+            use_prev_clip    = m.get("use_prev_clip", True),
             local_context_ratio = m.local_context_ratio,
+            use_tool         = m.get("use_tool", True),
+            tool_pred_layer  = m.get("tool_pred_layer", None),
             prompt           = m.prompt,
             attention_dropout= m.attention_dropout,
             hint_dropout     = m.hint_dropout,

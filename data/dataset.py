@@ -137,13 +137,14 @@ class VideoClipDataset(Dataset):
     def __len__(self) -> int:
         return self.num_clips
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
         """
         Returns:
-            frames:     (T, 3, H, W)  float32
-            tool_annots:(T, 7)        float32
-            labels:     (T,)          int64 phase indices
-            valid_mask: (T,)          bool, False for padded positions
+            frames:      (T, 3, H, W)  float32
+            tool_annots: (T, 7)        float32
+            labels:      (T,)          int64 phase indices
+            valid_mask:  (T,)          bool, False for padded positions
+            frame_start: int, absolute frame index of the first frame in this clip
         """
         start = idx * self.seq_len
         end   = min(start + self.seq_len, self.num_frames)
@@ -169,4 +170,4 @@ class VideoClipDataset(Dataset):
         valid_mask = torch.zeros(self.seq_len, dtype=torch.bool)
         valid_mask[:real_len] = True
 
-        return frames, tools, labels, valid_mask
+        return frames, tools, labels, valid_mask, start

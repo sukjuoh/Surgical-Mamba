@@ -75,13 +75,13 @@ def run_inference(model, video_id, cfg, device, ablate_flags: dict):
     all_logits  = []
     all_labels  = []
 
-    for frames, tools, labels, valid_mask in loader:
+    for frames, tools, labels, valid_mask, frame_start in loader:
         frames     = frames.to(device)
         tools      = tools.to(device)
         labels     = labels.to(device)
         valid_mask = valid_mask.to(device)
 
-        logits, memory, prev_visual, _, _ = model.forward_clip(
+        logits, _, memory, prev_visual, _, _ = model.forward_clip(
             frames      = frames,
             tool_annots = tools,
             memory      = memory,

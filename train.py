@@ -19,6 +19,10 @@ import random
 import argparse
 from collections import defaultdict
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
 import torch
 import torch.nn as nn
 from torch.amp import GradScaler, autocast
@@ -31,6 +35,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from models import SurgicalPhaseLLM, CHOLEC80_PHASES
 from data.dataset import VideoClipDataset
+from attn_analysis import get_region_groups
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -110,6 +115,27 @@ def temporal_smoothness_loss(
 
     weighted_kl = pair_conf * kl                             # (B, T-1)
     return weighted_kl[pair_mask].mean()
+
+
+def tool_aux_loss(
+    tool_logits: torch.Tensor,
+    tool_annots: torch.Tensor,
+    mask: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Auxiliary multi-label BCE loss for per-frame tool presence.
+
+    Args:
+        tool_logits: (B, T, 7)  raw logits
+        tool_annots: (B, T, 7)  binary ground truth
+        mask:        (B, T)     bool, True = valid frame
+    """
+    B, T, _ = tool_logits.shape
+    mask_exp = mask.unsqueeze(-1).expand_as(tool_logits)    # (B, T, 7)
+    loss = nn.functional.binary_cross_entropy_with_logits(
+        tool_logits[mask_exp], tool_annots.float()[mask_exp], reduction="mean"
+    )
+    return loss
 
 
 def hint_diversity_loss(hints: torch.Tensor) -> torch.Tensor:
@@ -192,19 +218,18 @@ def run_video_inference(
     all_logits = []
     all_labels = []
 
-    for clip_idx, (frames, tools, labels, valid_mask) in enumerate(loader):
+    for clip_idx, (frames, tools, labels, valid_mask, frame_start) in enumerate(loader):
         frames     = frames.to(device)
         tools      = tools.to(device)
         labels     = labels.to(device)
         valid_mask = valid_mask.to(device)
 
-        logits, memory, prev_visual, _, _ = model.forward_clip(
+        logits, _, memory, prev_visual, _, _ = model.forward_clip(
             frames      = frames,
             tool_annots = tools,
             memory      = memory,
             prev_visual = prev_visual,
             prompt_kv   = prompt_kv,
-            clip_idx    = clip_idx,
         )
         memory = memory.detach() if memory is not None else None
 
@@ -257,17 +282,115 @@ def compute_cls_metrics(
     }
 
 
+_ATTN_BAR_COLOURS = ["#4c72b0", "#55a868", "#c44e52", "#8172b2", "#ccb974", "#64b5cd", "#e07b39"]
+
+
+@torch.no_grad()
+def _collect_region_attn(model, video_id, cfg, device, max_clips=None):
+    """
+    Run a single video with output_attentions=True and accumulate per-region
+    attention weights averaged over all layers, heads, and frames.
+
+    Returns (avg_by_region dict, region_groups list), or (None, None) if empty.
+    """
+    dataset = VideoClipDataset(
+        video_id  = video_id,
+        data_root = cfg.data.data_root,
+        phase_dir = cfg.data.phase_annotation_dir,
+        tool_dir  = cfg.data.tool_annotation_dir,
+        seq_len   = cfg.data.seq_len,
+        img_size  = cfg.data.img_size,
+    )
+    loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0, pin_memory=False)
+
+    region_groups = get_region_groups(model.use_prev_clip)
+    num_layers    = model.llm.config.num_hidden_layers
+    prompt_kv     = model.build_prompt_kv()
+    memory        = None
+    prev_visual   = None
+
+    region_sums = {li: {g: 0.0 for g, _ in region_groups} for li in range(num_layers)}
+    n_clips = 0
+
+    for i, (frames, tools, labels, valid_mask, frame_start) in enumerate(loader):
+        if max_clips is not None and i >= max_clips:
+            break
+        frames = frames.to(device)
+        tools  = tools.to(device)
+
+        out = model.forward_clip(
+            frames=frames, tool_annots=tools,
+            memory=memory, prev_visual=prev_visual,
+            prompt_kv=prompt_kv,
+            output_attentions=True,
+        )
+        _, _, memory, prev_visual, _, _, attentions, regions = out
+        memory = memory.detach() if memory is not None else None
+
+        T_actual  = frames.shape[1]
+        total_len = attentions[0].shape[-1]
+
+        prompt_len_offset = regions.get("prompt", (0, 0))[1]
+        for li in range(num_layers):
+            a = attentions[li][0].float().cpu().numpy()   # (H, seq, seq)
+            H = a.shape[0]
+            # KV-cache mode:      a.shape[-2] == llm_input_len  (<  total_len)
+            #                     → subtract prompt_len to convert shifted positions to row indices
+            # Full-sequence mode: a.shape[-2] == total_len
+            #                     → shifted positions are already correct row indices
+            row_offset = 0 if a.shape[-2] == total_len else prompt_len_offset
+            # Extract visual token rows
+            s, e = regions["visual"]
+            visual_rows = a[:, s - row_offset : e - row_offset, :]  # (H, T, total_len)
+            for group_name, keys in region_groups:
+                col_sum = 0.0
+                for k in keys:
+                    if k not in regions:
+                        continue
+                    s, e = regions[k]
+                    e = min(e, total_len)
+                    if s < total_len:
+                        col_sum += float(visual_rows[:, :, s:e].sum())
+                region_sums[li][group_name] += col_sum / (H * T_actual)
+        n_clips += 1
+
+    if n_clips == 0:
+        return None, None
+
+    group_names = [g for g, _ in region_groups]
+    avg = {
+        g: sum(region_sums[li][g] for li in range(num_layers)) / (num_layers * n_clips)
+        for g in group_names
+    }
+    return avg, region_groups
+
+
+def _make_attn_bar_figure(avg_by_region: dict, region_groups: list) -> plt.Figure:
+    """Return a matplotlib Figure: bar chart of visual-token attention by region."""
+    group_names = [g for g, _ in region_groups if avg_by_region.get(g, 0) > 0]
+    values      = [avg_by_region[g] for g in group_names]
+
+    fig, ax = plt.subplots(figsize=(8, 3))
+    bars = ax.bar(group_names, values,
+                  color=_ATTN_BAR_COLOURS[:len(group_names)],
+                  edgecolor="k", linewidth=0.5)
+    ax.set_ylabel("Mean attention weight")
+    ax.set_title("Visual token → region (all layers avg)")
+    if values:
+        ax.set_ylim(0, max(values) * 1.25)
+        for bar, v in zip(bars, values):
+            ax.text(bar.get_x() + bar.get_width() / 2, v + max(values) * 0.01,
+                    f"{v:.3f}", ha="center", va="bottom", fontsize=8)
+    plt.tight_layout()
+    return fig
+
+
 @torch.no_grad()
 def evaluate_test(model: SurgicalPhaseLLM, cfg, device: torch.device, epoch: int):
     """
-    Evaluate on test videos with accuracy-boosting post-processing:
-      1. Temporal soft smoothing  (sliding window probability average)
-      2. Short-segment removal    (merge isolated phase blips)
-
     Reports: acc, macro precision, recall, Jaccard — printed and logged to WandB.
     """
-    smooth_window = cfg.train.get("test_smooth_window", 15)
-    min_seg_len   = cfg.train.get("test_min_segment",  10)
+
     num_phases    = cfg.data.num_phases
 
     # All metrics computed per-video then averaged (equal weight per video)
@@ -290,7 +413,7 @@ def evaluate_test(model: SurgicalPhaseLLM, cfg, device: torch.device, epoch: int
 
     print(
         f"\n{'='*60}\n"
-        f"[TEST @ Epoch {epoch}]  (smooth={smooth_window}fr, min_seg={min_seg_len}fr)\n"
+        f"[TEST @ Epoch {epoch}] \n"
         f"  Acc={m['acc']:.4f}  Precision={m['precision']:.4f}"
         f"  Recall={m['recall']:.4f}  Jaccard={m['jaccard']:.4f}\n"
         f"{'='*60}\n"
@@ -303,6 +426,25 @@ def evaluate_test(model: SurgicalPhaseLLM, cfg, device: torch.device, epoch: int
         "test/jaccard":   m["jaccard"],
         "epoch":          epoch,
     })
+
+    # ── Attention bar chart visualization ─────────────────────────────────────
+    max_clips = cfg.train.get("attn_log_max_clips", 20)
+    if max_clips > 0 and wandb.run is not None:
+        attn_video = cfg.data.test_videos[0]
+        print(f"  [attn] Collecting attention weights (video {attn_video:02d}, "
+              f"first {max_clips} clips)...")
+        model.llm.set_attn_implementation("eager")
+        try:
+            avg_attn, region_groups = _collect_region_attn(
+                model, attn_video, cfg, device, max_clips=max_clips,
+            )
+        finally:
+            model.llm.set_attn_implementation("sdpa")
+        if avg_attn is not None:
+            fig = _make_attn_bar_figure(avg_attn, region_groups)
+            wandb.log({"test/attn_bar": wandb.Image(fig), "epoch": epoch})
+            plt.close(fig)
+            print(f"  [attn] Logged attention bar chart to wandb.")
 
     return m
 
@@ -388,6 +530,8 @@ def run_video(
     total_loss_smooth = 0.0
     total_loss_div    = 0.0
     total_loss_attn   = 0.0
+    total_loss_tool   = 0.0
+    total_loss_frame  = 0.0
     total_correct = 0
     total_frames  = 0
     phase_correct = defaultdict(int)
@@ -413,14 +557,19 @@ def run_video(
     n_clips = len(clips)
 
     if is_train:
+        # accum_steps: how many TBPTT windows to accumulate before an optimizer step.
+        # tbptt_k=1 → step every 4 clips (too-frequent updates on tiny windows hurt stability).
+        # tbptt_k>1 → step every window (each window already spans several clips).
+        accum_steps = 4 if tbptt_k == 1 else 1
+        accum_count = 0
         optimizer.zero_grad()
         prompt_kv = model.build_prompt_kv() if llm_is_trainable else prompt_kv_static
 
-    for clip_idx, (frames, tools, labels, valid_mask) in enumerate(clips):
-        # frames:     (1, T, 3, H, W)
-        # tools:      (1, T, 7)
-        # labels:     (1, T)
-        # valid_mask: (1, T)
+    for clip_idx, (frames, tools, labels, valid_mask, frame_start) in enumerate(clips):
+        # frames:      (1, T, 3, H, W)
+        # tools:       (1, T, 7)
+        # labels:      (1, T)
+        # valid_mask:  (1, T)
         frames     = frames.to(device)
         tools      = tools.to(device)
         labels     = labels.to(device)
@@ -431,22 +580,27 @@ def run_video(
 
         with torch.set_grad_enabled(is_train):
             with autocast("cuda", enabled=(scaler is not None)):
-                logits, memory, prev_visual, hints, attn_loss = model.forward_clip(
+                logits, tool_logits, frame_aux_logits, memory, prev_visual, hints, attn_loss = model.forward_clip(
                     frames      = frames,
                     tool_annots = tools,
                     memory      = memory,
                     prev_visual = prev_visual,
                     prompt_kv   = prompt_kv,
-                    clip_idx    = clip_idx,
                 )
                 loss_ce     = masked_ce_loss(logits, labels, valid_mask,
                                              label_smoothing=cfg.train.label_smoothing)
                 loss_smooth = temporal_smoothness_loss(logits, valid_mask)
                 loss_div    = hint_diversity_loss(hints)
+                loss_tool   = (tool_aux_loss(tool_logits, tools, valid_mask)
+                               if model.use_tool else loss_ce.new_tensor(0.0))
+                loss_frame  = masked_ce_loss(frame_aux_logits, labels, valid_mask,
+                                             label_smoothing=cfg.train.label_smoothing)
                 loss = (loss_ce
                         + cfg.train.w_smooth     * loss_smooth
                         + cfg.train.w_diversity  * loss_div
-                        + cfg.train.w_attn_focus * attn_loss)
+                        + cfg.train.w_attn_focus * attn_loss
+                        + cfg.train.w_tool       * loss_tool
+                        + cfg.train.w_frame      * loss_frame)
 
         if is_train:
             window_loss   = loss if window_loss is None else window_loss + loss
@@ -455,33 +609,34 @@ def run_video(
             is_window_end = (window_clips >= tbptt_k) or is_last_clip
 
             if is_window_end:
+                # TBPTT: backward per window to let gradient flow through memory chain.
                 avg_loss = window_loss / window_clips
                 if scaler is not None:
                     scaler.scale(avg_loss).backward()
-                    scaler.unscale_(optimizer)
-                    if cfg.train.grad_clip > 0:
-                        nn.utils.clip_grad_norm_(model.parameters(), cfg.train.grad_clip)
-                    scaler.step(optimizer)
-                    scaler.update()
                 else:
                     avg_loss.backward()
-                    if cfg.train.grad_clip > 0:
-                        nn.utils.clip_grad_norm_(model.parameters(), cfg.train.grad_clip)
-                    optimizer.step()
-                if scheduler is not None:
-                    scheduler.step()
 
-                # Detach memory at window boundary so next window starts fresh
+                # Detach memory at TBPTT boundary
                 if memory is not None:
                     memory = memory.detach()
 
-                optimizer.zero_grad()
-                # Rebuild prompt KV after optimizer step (LoRA weights updated)
-                if llm_is_trainable and not is_last_clip:
-                    prompt_kv = model.build_prompt_kv()
-
                 window_loss  = None
                 window_clips = 0
+                accum_count += 1
+
+                # Optimizer step: every accum_steps windows, or at the last clip.
+                if accum_count % accum_steps == 0 or is_last_clip:
+                    if scaler is not None:
+                        scaler.unscale_(optimizer)
+                        if cfg.train.grad_clip > 0:
+                            nn.utils.clip_grad_norm_(model.parameters(), cfg.train.grad_clip)
+                        scaler.step(optimizer)
+                        scaler.update()
+                    else:
+                        if cfg.train.grad_clip > 0:
+                            nn.utils.clip_grad_norm_(model.parameters(), cfg.train.grad_clip)
+                        optimizer.step()
+                    optimizer.zero_grad()
 
         # Accumulate metrics (detach for safety)
         total_loss        += loss.item()
@@ -489,6 +644,8 @@ def run_video(
         total_loss_smooth += loss_smooth.item()
         total_loss_div    += loss_div.item()
         total_loss_attn   += attn_loss.item()
+        total_loss_tool   += loss_tool.item()
+        total_loss_frame  += loss_frame.item()
         correct, total = compute_accuracy(logits, labels, valid_mask)
         total_correct += correct
         total_frames  += total
@@ -501,6 +658,10 @@ def run_video(
                 phase_total[ph]   += ph_mask.sum().item()
                 phase_correct[ph] += (preds[ph_mask] == ph).sum().item()
 
+    # Scheduler steps once per video (LR decay paced by number of videos processed).
+    if is_train and scheduler is not None:
+        scheduler.step()
+
     num_clips = max(1, len(loader))
     return {
         "loss":        total_loss        / num_clips,
@@ -508,6 +669,8 @@ def run_video(
         "loss_smooth": total_loss_smooth / num_clips,
         "loss_div":    total_loss_div    / num_clips,
         "loss_attn":   total_loss_attn   / num_clips,
+        "loss_tool":   total_loss_tool   / num_clips,
+        "loss_frame":  total_loss_frame  / num_clips,
         "correct":       total_correct,
         "total":         total_frames,
         "phase_correct": phase_correct,
@@ -572,6 +735,8 @@ def main():
         epoch_loss_smooth = 0.0
         epoch_loss_div    = 0.0
         epoch_loss_attn   = 0.0
+        epoch_loss_tool   = 0.0
+        epoch_loss_frame  = 0.0
         epoch_correct = 0
         epoch_total   = 0
         epoch_phase_correct = defaultdict(int)
@@ -590,6 +755,8 @@ def main():
             epoch_loss_smooth += result["loss_smooth"]
             epoch_loss_div    += result["loss_div"]
             epoch_loss_attn   += result["loss_attn"]
+            epoch_loss_tool   += result["loss_tool"]
+            epoch_loss_frame  += result["loss_frame"]
             epoch_correct += result["correct"]
             epoch_total   += result["total"]
             for ph in range(cfg.data.num_phases):
@@ -616,6 +783,8 @@ def main():
         train_loss_smooth = epoch_loss_smooth / n_vid
         train_loss_div    = epoch_loss_div    / n_vid
         train_loss_attn   = epoch_loss_attn   / n_vid
+        train_loss_tool   = epoch_loss_tool   / n_vid
+        train_loss_frame  = epoch_loss_frame  / n_vid
 
         wandb.log({
             "train/loss":        train_loss,
@@ -623,13 +792,16 @@ def main():
             "train/loss_smooth": train_loss_smooth,
             "train/loss_div":    train_loss_div,
             "train/loss_attn":   train_loss_attn,
+            "train/loss_tool":   train_loss_tool,
+            "train/loss_frame":  train_loss_frame,
             "train/accuracy":    train_acc,
             "epoch":             epoch,
         })
 
         print(f"\n=== Epoch {epoch} Train | loss {train_loss:.4f} "
               f"(ce={train_loss_ce:.3f} sm={train_loss_smooth:.3f} "
-              f"div={train_loss_div:.3f} attn={train_loss_attn:.3f})"
+              f"div={train_loss_div:.3f} attn={train_loss_attn:.3f} "
+              f"tool={train_loss_tool:.3f} frame={train_loss_frame:.3f})"
               f" | acc {train_acc:.4f} ===")
 
         # ── Test evaluation every epoch ───────────────────────────────────────

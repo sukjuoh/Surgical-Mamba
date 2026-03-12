@@ -31,7 +31,18 @@ model:
   # ── Local context compressor ──────────────────────────────────────────────
   # Last T//ratio frames of the previous clip, prepended as local context.
   # Provides the most recent visual context bridging into the current clip.
-  local_context_ratio: 4            # keep last 1/ratio frames (4 → last T//4 frames)
+  use_prev_clip: true                # whether to use previous clip as local context
+  local_context_ratio: 6            # keep last 1/ratio frames (4 → last T//4 frames)
+
+  # ── Auxiliary tool prediction ──────────────────────────────────────────────
+  # Tool presence correlates strongly with phase but is a low-level visual cue.
+  # Predicting tools from an early LLM layer (rather than the final layer) forces
+  # the early layers to encode tool information, letting it propagate as context
+  # through the remaining layers for phase prediction.
+  # 0 = embedding output (before any transformer layer); N = after N-th layer (0-indexed).
+  # Use null to keep the original behaviour (predict from the same final layer as phase).
+  use_tool: false                      # whether to use tool tokens in LLM input and tool aux loss
+  tool_pred_layer: 16                 # LLM layer index whose hidden state is used for tool aux loss
 
   # ── Trainable layers ──────────────────────────────────────────────────────
   # LLM options (pick one):
@@ -141,13 +152,15 @@ train:
   lora_lr_factor: 0.1              # LoRA adapter lr = lr × factor (lower to preserve pretrained weights)
   weight_decay: 0.01
   grad_clip: 1.0
-  tbptt_k: 4                       # TBPTT window: gradient flows across K clips before detach
+  tbptt_k: 1                       # TBPTT window: gradient flows across K clips before detach
 
   # ── Loss weights ──────────────────────────────────────────────────────────
   label_smoothing: 0.1   # CE label smoothing (0.1 = soft targets)
   w_smooth:        0.1   # temporal smoothness loss weight (all adjacent pairs)
   w_diversity:     0.1   # hint diversity loss weight
-  w_attn_focus:    0.05  # hint attention focus loss weight
+  w_attn_focus:    0.1  # hint attention focus loss weight
+  w_tool:          0.1   # auxiliary tool prediction loss weight (multi-label BCE)
+  w_frame:         0.3   # frame-level auxiliary phase loss (Linear on TemporalRefiner output)
 
   # Learning rate scheduler
   scheduler: "cosine"              # "cosine" | "step" | null
@@ -160,3 +173,9 @@ train:
 
   # ── Test evaluation ───────────────────────────────────────────────────────
   test_eval_interval: 10           # run test evaluation every N epochs
+
+  # ── Attention visualization (wandb) ───────────────────────────────────────
+  # Logs a bar chart of visual-token → region attention weights to wandb
+  # at every test evaluation. Uses the first test video, limited to
+  # attn_log_max_clips clips (to keep it fast). Set to 0 to disable.
+  attn_log_max_clips: 20           # 0 = disabled

@@ -43,24 +43,30 @@ from data.dataset import VideoClipDataset
 
 # ── Region grouping ───────────────────────────────────────────────────────────
 # Headers are short; merge them with their payload for readability.
-_REGION_GROUPS = [
+_REGION_GROUPS_BASE = [
     ("Prompt",      ["prompt"]),
     ("Memory",      ["memory_hdr", "memory"]),
     ("Hints",       ["hints_hdr", "hints"]),
-    ("Tool text",   ["tool"]),
     ("Prev clip",   ["prev_hdr", "prev"]),
+    ("Tool tokens", ["tool_hdr", "tool"]),
     ("Visual hdr",  ["visual_hdr"]),
     ("Visual self", ["visual"]),
 ]
+
+
+def get_region_groups(use_prev_clip: bool = True) -> list:
+    if use_prev_clip:
+        return _REGION_GROUPS_BASE
+    return [g for g in _REGION_GROUPS_BASE if g[0] != "Prev clip"]
 
 # Colours for bar chart
 _COLOURS = ["#4c72b0", "#55a868", "#c44e52", "#8172b2", "#ccb974", "#64b5cd", "#e07b39"]
 
 
-def build_region_labels(regions: dict, total_len: int) -> list:
+def build_region_labels(regions: dict, total_len: int, region_groups: list) -> list:
     """Return a per-token list of region group names for axis tick labelling."""
     labels = ["?"] * total_len
-    for group_name, keys in _REGION_GROUPS:
+    for group_name, keys in region_groups:
         for k in keys:
             if k not in regions:
                 continue
@@ -70,13 +76,13 @@ def build_region_labels(regions: dict, total_len: int) -> list:
     return labels
 
 
-def aggregate_by_region(attn_row: np.ndarray, regions: dict, total_len: int) -> dict:
+def aggregate_by_region(attn_row: np.ndarray, regions: dict, total_len: int, region_groups: list) -> dict:
     """
     Sum attention weights in attn_row (shape: total_len) into region groups.
     Returns dict group_name → summed attention.
     """
     out = {}
-    for group_name, keys in _REGION_GROUPS:
+    for group_name, keys in region_groups:
         total = 0.0
         for k in keys:
             if k not in regions:
@@ -100,6 +106,7 @@ def extract_attentions_video(model, video_id, cfg, device):
         regions:      dict  region name → (start, end) — from the last clip (representative)
         T:            int   frames per clip
         num_layers:   int
+        region_groups: list  active region groups (respects model.use_prev_clip)
     """
     dataset = VideoClipDataset(
         video_id  = video_id,
@@ -112,19 +119,21 @@ def extract_attentions_video(model, video_id, cfg, device):
     loader = DataLoader(dataset, batch_size=1, shuffle=False,
                         num_workers=0, pin_memory=False)
 
+    region_groups = get_region_groups(model.use_prev_clip)
+
     prompt_kv   = model.build_prompt_kv()
     memory      = None
     prev_visual = None
     num_layers  = model.llm.config.num_hidden_layers
 
     # layer → group → accumulated sum
-    region_sums = {li: {g: 0.0 for g, _ in _REGION_GROUPS} for li in range(num_layers)}
+    region_sums = {li: {g: 0.0 for g, _ in region_groups} for li in range(num_layers)}
     total_counts = 0   # number of (frame × head) samples accumulated
     last_regions = None
     T = cfg.data.seq_len
     n_clips = len(loader)
 
-    for i, (frames, tools, labels, valid_mask) in enumerate(loader):
+    for i, (frames, tools, labels, valid_mask, frame_start) in enumerate(loader):
         frames = frames.to(device)
         tools  = tools.to(device)
         print(f"  clip {i+1:3d}/{n_clips}", end="\r", flush=True)
@@ -134,19 +143,31 @@ def extract_attentions_video(model, video_id, cfg, device):
             memory=memory, prev_visual=prev_visual, prompt_kv=prompt_kv,
             output_attentions=True,
         )
-        _, memory, prev_visual, _, _, attentions, regions = out
+        _, _, memory, prev_visual, _, _, attentions, regions = out
         memory = memory.detach() if memory is not None else None
         last_regions = regions
         T_actual = frames.shape[1]
         total_len = attentions[0].shape[-1]
 
         # Accumulate: for each layer, sum attention from visual rows to each region
+        prompt_len_offset = regions.get("prompt", (0, 0))[1]
         for li in range(num_layers):
             a = attentions[li][0].float().cpu().numpy()   # (H, seq, seq)
             H = a.shape[0]
-            visual_rows = a[:, -T_actual:, :]              # (H, T, total_len)
+            # Determine row offset:
+            #   KV-cache mode:      a.shape = (H, llm_input_len, prompt+llm_input_len)
+            #                       → rows are 0-indexed over llm_input only
+            #                       → subtract prompt_len to convert shifted positions to row indices
+            #   Full-sequence mode (LoRA / no KV-cache):
+            #                       a.shape = (H, prompt+llm_input_len, prompt+llm_input_len)
+            #                       → rows include prompt prefix
+            #                       → shifted positions are already correct row indices (row_offset=0)
+            row_offset = 0 if a.shape[1] == total_len else prompt_len_offset
+            # Extract visual token rows
+            s, e = regions["visual"]
+            visual_rows = a[:, s - row_offset : e - row_offset, :]  # (H, T, total_len)
 
-            for group_name, keys in _REGION_GROUPS:
+            for group_name, keys in region_groups:
                 col_sum = 0.0
                 for k in keys:
                     if k not in regions:
@@ -161,12 +182,15 @@ def extract_attentions_video(model, video_id, cfg, device):
         total_counts += 1   # one clip
 
     print()  # newline after \r progress
-    return region_sums, total_counts, last_regions, T, num_layers
+    return region_sums, total_counts, last_regions, T, num_layers, region_groups
 
 
-def plot_summary_bar(avg_by_region: dict, video_id: int, out_dir: str, suffix: str = ""):
+def plot_summary_bar(avg_by_region: dict, video_id: int, out_dir: str, suffix: str = "",
+                     region_groups: list = None):
     """Bar chart: average attention from visual tokens to each region."""
-    group_names = [g for g, _ in _REGION_GROUPS if avg_by_region.get(g, 0) > 0]
+    if region_groups is None:
+        region_groups = _REGION_GROUPS_BASE
+    group_names = [g for g, _ in region_groups if avg_by_region.get(g, 0) > 0]
     values      = [avg_by_region[g] for g in group_names]
     label       = "latter-half layers" if suffix == "_latter" else "all layers"
 
@@ -186,9 +210,11 @@ def plot_summary_bar(avg_by_region: dict, video_id: int, out_dir: str, suffix: s
 
 
 def plot_layer_bar(region_sums_layer: dict, n_clips: int, layer_idx: int,
-                   video_id: int, out_dir: str):
+                   video_id: int, out_dir: str, region_groups: list = None):
     """Bar chart per layer: avg attention from visual tokens to each region."""
-    group_names = [g for g, _ in _REGION_GROUPS if region_sums_layer.get(g, 0) > 0]
+    if region_groups is None:
+        region_groups = _REGION_GROUPS_BASE
+    group_names = [g for g, _ in region_groups if region_sums_layer.get(g, 0) > 0]
     values      = [region_sums_layer[g] / n_clips for g in group_names]
 
     fig, ax = plt.subplots(figsize=(9, 4))
@@ -243,14 +269,15 @@ def main():
     print(f"LLM has {num_layers} layers. Per-layer plots: {args.layers}")
 
     print(f"\nProcessing full video {args.video:02d} ...")
-    region_sums, n_clips, regions, T, _ = extract_attentions_video(
+    print(f"  use_prev_clip: {model.use_prev_clip}")
+    region_sums, n_clips, regions, T, _, region_groups = extract_attentions_video(
         model, args.video, cfg, device
     )
     print(f"  Total clips processed: {n_clips}")
     print(f"  Regions detected: {list(regions.keys())}")
 
     # ── All-layer average ─────────────────────────────────────────────────────
-    avg_by_region = {g: 0.0 for g, _ in _REGION_GROUPS}
+    avg_by_region = {g: 0.0 for g, _ in region_groups}
     for li in range(num_layers):
         for g in avg_by_region:
             avg_by_region[g] += region_sums[li][g]
@@ -263,11 +290,11 @@ def main():
         bar = "█" * int(v / max_v * 40)
         print(f"  {g:<14}: {v:.4f}  {bar}")
 
-    plot_summary_bar(avg_by_region, args.video, args.out)
+    plot_summary_bar(avg_by_region, args.video, args.out, region_groups=region_groups)
 
     # ── Latter-half layers average (more meaningful — output head uses last layer) ──
     latter_start = num_layers // 2
-    avg_latter = {g: 0.0 for g, _ in _REGION_GROUPS}
+    avg_latter = {g: 0.0 for g, _ in region_groups}
     latter_count = num_layers - latter_start
     for li in range(latter_start, num_layers):
         for g in avg_latter:
@@ -281,14 +308,14 @@ def main():
         bar = "█" * int(v / max_v * 40)
         print(f"  {g:<14}: {v:.4f}  {bar}")
 
-    plot_summary_bar(avg_latter, args.video, args.out, suffix="_latter")
+    plot_summary_bar(avg_latter, args.video, args.out, suffix="_latter", region_groups=region_groups)
 
     # ── Per-layer bar charts ──────────────────────────────────────────────────
     for li in args.layers:
         if li < 0 or li >= num_layers:
             print(f"  Warning: layer {li} out of range, skipping.")
             continue
-        plot_layer_bar(region_sums[li], n_clips, li, args.video, args.out)
+        plot_layer_bar(region_sums[li], n_clips, li, args.video, args.out, region_groups=region_groups)
 
     print(f"\nDone. Figures saved to: {args.out}/")
 
