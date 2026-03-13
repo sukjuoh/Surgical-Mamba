@@ -159,7 +159,7 @@ class ClipHintEncoder(nn.Module):
         Returns:
             scalar loss
         """
-        
+
         mean_feat = torch.bmm(attn_weights, visual_feats)
 
         feat_norm = F.normalize(visual_feats, dim=-1)   # (B, T, d_visual)
@@ -190,6 +190,6 @@ class ClipHintEncoder(nn.Module):
         # attn_weights: (B, N_hints, T)
 
         #attn_focus_loss = self._attention_focus_loss(attn_weights, T)
-        attn_focus_loss = self._semantic_chunking_loss(attn_weights)
+        attn_focus_loss = self._semantic_chunking_loss(attn_weights, visual_feats)
 
         return self.final_norm(q), attn_focus_loss
