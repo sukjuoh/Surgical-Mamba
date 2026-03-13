@@ -151,6 +151,21 @@ class ClipHintEncoder(nn.Module):
             total  = total + (1.0 - in_seg).mean()
         return total / N
 
+    def _semantic_chunking_loss(self, attn_weights: torch.Tensor) -> torch.Tensor:
+        """  
+        Args:
+            attn_weights: (B, N_hints, T) 
+        Returns:
+            scalar loss
+        """
+        # Temporal Smoothness 
+        temporal_diff = torch.abs(attn_weights[:, :, 1:] - attn_weights[:, :, :-1])
+        smoothness_loss = temporal_diff.mean()
+
+        # 2. Attention Entropy 
+        entropy_loss = -torch.sum(attn_weights * torch.log(attn_weights + 1e-8), dim=-1).mean()
+        return smoothness_loss + (0.1 * entropy_loss)
+
     def forward(self, visual_feats: torch.Tensor):
         """
         Args:
@@ -172,6 +187,7 @@ class ClipHintEncoder(nn.Module):
         q, attn_weights = self.blocks[-1](q, visual_feats, return_attn=True)
         # attn_weights: (B, N_hints, T)
 
-        attn_focus_loss = self._attention_focus_loss(attn_weights, T)
+        #attn_focus_loss = self._attention_focus_loss(attn_weights, T)
+        attn_focus_loss = self._semantic_chunking_loss(attn_weights)
 
         return self.final_norm(q), attn_focus_loss
