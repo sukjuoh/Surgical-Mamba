@@ -22,7 +22,7 @@ ClipHintEncoder (Q-Former style, BLIP-2)
 
 import torch
 import torch.nn as nn
-
+import torch.nn.functional as F
 
 class QFormerBlock(nn.Module):
     """
@@ -151,20 +151,22 @@ class ClipHintEncoder(nn.Module):
             total  = total + (1.0 - in_seg).mean()
         return total / N
 
-    def _semantic_chunking_loss(self, attn_weights: torch.Tensor) -> torch.Tensor:
-        """  
+    def _semantic_chunking_loss(self, attn_weights: torch.Tensor, visual_feats: torch.Tensor) -> torch.Tensor:
+        """
         Args:
-            attn_weights: (B, N_hints, T) 
+            attn_weights: (B, N_hints, T)  already-softmaxed attention probabilities
+            visual_feats: (B, T, d_visual) temporally-refined VMamba features
         Returns:
             scalar loss
         """
-        # Temporal Smoothness 
-        temporal_diff = torch.abs(attn_weights[:, :, 1:] - attn_weights[:, :, :-1])
-        smoothness_loss = temporal_diff.mean()
+        
+        mean_feat = torch.bmm(attn_weights, visual_feats)
 
-        # 2. Attention Entropy 
-        entropy_loss = -torch.sum(attn_weights * torch.log(attn_weights + 1e-8), dim=-1).mean()
-        return smoothness_loss + (0.1 * entropy_loss)
+        feat_norm = F.normalize(visual_feats, dim=-1)   # (B, T, d_visual)
+        mean_norm = F.normalize(mean_feat, dim=-1)       # (B, N_hints, d_visual)
+        cosine = torch.bmm(mean_norm, feat_norm.transpose(1, 2))  # (B, N_hints, T)
+
+        return (attn_weights * (1 - cosine)).sum(dim=-1).mean()
 
     def forward(self, visual_feats: torch.Tensor):
         """
