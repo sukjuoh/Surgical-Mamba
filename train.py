@@ -1,4 +1,4 @@
-"""Training script for CausalSurgicalMamba on Cholec80.
+"""Training script for CausalSurgicalMamba.
 
 Usage::
 
