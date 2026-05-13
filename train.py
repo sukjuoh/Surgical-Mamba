@@ -17,7 +17,6 @@ import random
 import argparse
 from collections import defaultdict
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -43,7 +42,7 @@ from data.dataset import VideoClipDataset
 DATASET_SPLITS = {
     "cholec80": {
         "train_videos":    list(range(1, 41)),
-        "val_videos":      list(range(41, 81)),
+        "val_videos":      list(range(33, 41)),
         "test_videos":     list(range(41, 81)),
         "tag_format":      "video{:02d}",
         "eval_tag_format": "video{:02d}",
@@ -51,7 +50,7 @@ DATASET_SPLITS = {
     },
     "m2cai16": {
         "train_videos":    list(range(1, 28)),
-        "val_videos":      list(range(1, 15)),
+        "val_videos":      list(range(21, 28)),
         "test_videos":     list(range(1, 15)),
         "tag_format":      "workflow_video_{:02d}",
         "eval_tag_format": "test_workflow_video_{:02d}",
@@ -97,8 +96,11 @@ def _dataset_kwargs(cfg, is_train: bool = False, tag_format: str = None) -> dict
     )
 
 
-def _eval_tag_format(cfg) -> str:
-    return _splits(cfg)["eval_tag_format"]
+def _tag_format(cfg, split: str) -> str:
+    """Tag format per split. M2CAI16 uses a separate prefix for the test split;
+    the val split reuses the train naming (it is a subset of train videos)."""
+    s = _splits(cfg)
+    return s["eval_tag_format"] if split == "test" else s["tag_format"]
 
 
 def temporal_smoothness_loss(
@@ -246,40 +248,25 @@ def compute_cls_metrics(preds, labels, num_phases):
 def _evaluate_videos(model, video_ids, cfg, device, epoch, tag: str):
     num_phases = cfg.data.num_phases
     model.eval()
-    eval_tag_format = _eval_tag_format(cfg)
+    tag_format = _tag_format(cfg, tag)
 
     clip_metrics = []
-    all_logits, all_labels = [], []
     for video_id in video_ids:
         logits, labels = run_video_inference(
-            model, video_id, cfg, device, tag_format=eval_tag_format,
+            model, video_id, cfg, device, tag_format=tag_format,
         )
         clip_metrics.append(compute_cls_metrics(logits.argmax(-1), labels, num_phases))
-        all_logits.append(logits)
-        all_labels.append(labels)
 
     def avg(metrics, key):
         return sum(v[key] for v in metrics) / len(metrics)
 
     mc = {k: avg(clip_metrics, k) for k in ("acc", "precision", "recall", "jaccard")}
 
-    from sklearn.metrics import average_precision_score
-    cat_logits = torch.cat(all_logits, dim=0).float().numpy()
-    cat_labels = torch.cat(all_labels, dim=0).numpy()
-    probs = torch.softmax(torch.from_numpy(cat_logits), dim=-1).numpy()
-    aps = []
-    for c in range(num_phases):
-        y_true = (cat_labels == c).astype("int")
-        if y_true.sum() == 0:
-            continue
-        aps.append(average_precision_score(y_true, probs[:, c]))
-    mc["map"] = float(np.mean(aps)) if aps else 0.0
-
     print(
         f"\n{'='*60}\n"
         f"[{tag.upper()} @ Epoch {epoch}]\n"
         f"  Clip — Acc={mc['acc']:.4f}  Prec={mc['precision']:.4f}"
-        f"  Rec={mc['recall']:.4f}  Jac={mc['jaccard']:.4f}  mAP={mc['map']:.4f}\n"
+        f"  Rec={mc['recall']:.4f}  Jac={mc['jaccard']:.4f}\n"
         f"{'='*60}\n"
     )
     wandb.log({
@@ -287,7 +274,6 @@ def _evaluate_videos(model, video_ids, cfg, device, epoch, tag: str):
         f"{tag}_clip/precision": mc["precision"],
         f"{tag}_clip/recall":    mc["recall"],
         f"{tag}_clip/jaccard":   mc["jaccard"],
-        f"{tag}_clip/map":       mc["map"],
         "epoch":                 epoch,
     })
     return mc
@@ -647,7 +633,6 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--save_dir", default="./checkpoints")
     p.add_argument("--log_interval", type=int, default=10)
     p.add_argument("--patience", type=int, default=0)
-    p.add_argument("--best_metric", default="acc", choices=["acc", "map"])
     p.add_argument("--wandb_project", default="surgical-phase-mamba")
     p.add_argument("--wandb_run_name", default=None)
     return p
@@ -706,7 +691,6 @@ def _args_to_cfg(args) -> "OmegaConf":
             "save_dir":           args.save_dir,
             "log_interval":       args.log_interval,
             "patience":           args.patience,
-            "best_metric":        args.best_metric,
             "wandb_project":      args.wandb_project,
             "wandb_run_name":     args.wandb_run_name,
         },
@@ -819,8 +803,7 @@ def main():
         mo = evaluate_val(model, cfg, device, epoch)
         model.train()
 
-        best_metric = cfg.train.get("best_metric", "acc")
-        score = mo["map"] if best_metric == "map" else mo["acc"]
+        score = mo["acc"]
         if score > best_val_acc:
             best_val_acc = score
             epochs_no_improve = 0
