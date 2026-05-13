@@ -16,14 +16,10 @@ from .extractors import ConvNeXtTinyExtractor
 from .surgical_mamba import SurgicalMamba
 
 
-# ── FFN (transformer-classic, GELU) ───────────────────────────────────────────
+# ── FFN ───────────────────────────────────────────────────────────────────────
 
 class FFN(nn.Module):
-    """2-layer FFN with GELU. Hidden dim = 4·d_model (transformer standard).
-
-    Same param count as SwiGLU(hidden_ratio=8/3) (8·d² each), one fewer matmul.
-    No silu gate inside — avoids redundancy with Mamba block's internal silu(z).
-    """
+    """2-layer FFN with GELU. Hidden dim = ``hidden_ratio · d_model``."""
 
     def __init__(self, d_model: int, hidden_ratio: float = 4.0, bias: bool = True):
         super().__init__()
@@ -39,13 +35,7 @@ class FFN(nn.Module):
 # ── Building blocks ────────────────────────────────────────────────────────────
 
 class _CausalMamba2Block(nn.Module):
-    """Mamba2 block with per-chunk T_state + FFN. Used inside MambaHead.
-
-    Architecture (per block):
-        x → Conv → x_proj (dt_raw, B, C) → SSD kernel (chunked) → T_state at chunk-end
-        output gated via silu(z), out_proj, residual, FFN.
-    T_state: per-head low-rank (U@V^T) softmax, chunk-mean input per-head.
-    """
+    """Mamba2 block with per-chunk T_state + FFN. Used inside MambaHead."""
 
     def __init__(self, d_model, d_state=16, d_conv=4, expand=2,
                  d_head=64, chunk_size=32, T_rank=16, dropout=0.0):
@@ -56,7 +46,7 @@ class _CausalMamba2Block(nn.Module):
         assert self.d_inner % d_head == 0, \
             f"d_inner ({self.d_inner}) must be divisible by d_head ({d_head})"
         self.n_heads = self.d_inner // d_head
-        self.ngroups = self.n_heads  # per-head independent B, C
+        self.ngroups = self.n_heads
         self.d_state = d_state
         self.d_conv = d_conv
         self.chunk_size = chunk_size
@@ -78,7 +68,7 @@ class _CausalMamba2Block(nn.Module):
             bias=False,
         )
         self.dt_proj = nn.Linear(self.dt_rank, self.n_heads, bias=True)
-        # dt bias init: softplus inverse of uniform(0.001, 0.1)
+        # dt bias init: softplus inverse of uniform(0.001, 0.1).
         dt = torch.exp(
             torch.rand(self.n_heads) * (math.log(0.1) - math.log(0.001)) + math.log(0.001)
         ).clamp(min=1e-4)
@@ -87,25 +77,23 @@ class _CausalMamba2Block(nn.Module):
             self.dt_proj.bias.copy_(inv_dt)
         self.dt_proj.bias._no_reinit = True
 
-        # A init: uniform(1, d_state), wide decay range.
         A = torch.empty(self.n_heads).uniform_(1.0, float(d_state))
         self.A_log = nn.Parameter(torch.log(A))
         self.A_log._no_weight_decay = True
         self.D = nn.Parameter(torch.ones(self.n_heads))
         self.D._no_weight_decay = True
 
-        # Pre-projection RMSNorm (Mamba2 standard).
         self.norm_pre_out = nn.RMSNorm(self.d_inner, eps=1e-5)
         self.out_proj = nn.Linear(self.d_inner, d_model, bias=False)
 
-        # Per-head SVD filter: UV shared MLP (output split) + σ separate MLP.
         from .surgical_mamba import _PerHeadMLP
         stab_hidden = 128
         self.UV_mlp = _PerHeadMLP(self.n_heads, d_head, stab_hidden, 2 * d_state * T_rank,
                                   w1_gain=1.0, w2_gain=2.0)
         self.S_mlp  = _PerHeadMLP(self.n_heads, d_head, stab_hidden, T_rank,
                                   w1_gain=1.0, w2_gain=2.0)
-        # Gram-Schmidt across heads — orthogonal U, V init in flattened n*r space.
+        # Per-head Gram-Schmidt: orthogonalise U_init / V_init across heads in
+        # flattened n*r space → diverse rotations at init.
         _head_total = d_state * T_rank
         _head_scale = 0.5 * math.sqrt(_head_total)
         _Q_U_head, _ = torch.linalg.qr(torch.randn(_head_total, self.n_heads))
@@ -118,32 +106,33 @@ class _CausalMamba2Block(nn.Module):
                 self.UV_mlp.b2[h].copy_(torch.cat([U_init, V_init]).to(
                     self.UV_mlp.b2.device, dtype=self.UV_mlp.b2.dtype))
 
-        # FFN
         self.ffn_norm = nn.LayerNorm(d_model)
         self.ffn = FFN(d_model)
         self.drop = nn.Dropout(dropout)
 
     def _apply_T_state(self, h, chunk_feat_per_head):
-        """Apply orthogonal rotation via UV shared MLP (split) + separate σ MLP.
-        U, V column-normalized so σ alone controls rotation magnitude.
-        h: (B, H, P, n). chunk_feat_per_head: (B, H, P). Returns h' (same shape)."""
+        """Apply per-chunk Cayley orthogonal rotation to SSM state ``h``.
+
+        Args:
+            h: (B, H, P, n) SSM state.
+            chunk_feat_per_head: (B, H, P) chunk-level feature per head.
+        """
         B, H, P, n = h.shape
         r = self.T_rank
         chunk_feat_per_head = F.layer_norm(chunk_feat_per_head, [P])
-        UV_flat = self.UV_mlp(chunk_feat_per_head)                             # (B, H, 2nr)
+        UV_flat = self.UV_mlp(chunk_feat_per_head)
         U_flat, V_flat = UV_flat.chunk(2, dim=-1)
         U = F.normalize(U_flat.view(B, H, n, r), dim=-2)
         V = F.normalize(V_flat.view(B, H, n, r), dim=-2)
-        sigma_logit = self.S_mlp(chunk_feat_per_head)                          # (B, H, r)
-        # Force fp32 for Cayley (autocast wraps everything in bf16 otherwise).
-        # M = (I + S/2)·(I − S/2)⁻¹ — orthogonal, numerically stable for any ‖S‖.
+        sigma_logit = self.S_mlp(chunk_feat_per_head)
+        # Cayley: M = (I + S/2)·(I − S/2)⁻¹, orthogonal. fp32 for stability.
         with torch.amp.autocast("cuda", enabled=False):
             sigma = F.softplus(sigma_logit.float())
             UV = torch.einsum("bhnr,bhr,bhmr->bhnm", U.float(), sigma, V.float())
             S = UV - UV.transpose(-2, -1)
             I_S = torch.eye(n, device=S.device, dtype=S.dtype).expand_as(S)
             S_half = S * 0.5
-            M = torch.linalg.solve(I_S - S_half, I_S + S_half)                   # Cayley
+            M = torch.linalg.solve(I_S - S_half, I_S + S_half)
             return torch.einsum("bhpn,bhnm->bhpm", h.float(), M)
 
     def forward(self, x):
@@ -154,7 +143,7 @@ class _CausalMamba2Block(nn.Module):
 
         xz = self.in_proj(x_norm)
         xz = rearrange(xz, "b l d -> b d l")
-        x_in, z = xz.chunk(2, dim=1)                                   # (B, d_inner, L)
+        x_in, z = xz.chunk(2, dim=1)
 
         if causal_conv1d_fn is None:
             x_conv = self.act(self.conv1d(x_in)[..., :L])
@@ -169,18 +158,17 @@ class _CausalMamba2Block(nn.Module):
         dt_raw, B_all, C_all = torch.split(
             x_db, [self.dt_rank, self.ngroups * self.d_state, self.ngroups * self.d_state], dim=-1,
         )
-        dt = self.dt_proj.weight @ dt_raw.t()                          # (H, B*L)
+        dt = self.dt_proj.weight @ dt_raw.t()
         dt = rearrange(dt, "h (b l) -> b l h", l=L).contiguous()
 
         B_all = rearrange(B_all, "(b l) (g n) -> b l g n", l=L, g=self.ngroups).contiguous()
         C_all = rearrange(C_all, "(b l) (g n) -> b l g n", l=L, g=self.ngroups).contiguous()
         x_rs = rearrange(x_conv, "b (h p) l -> b l h p", p=self.d_head).contiguous()
 
-        A = -torch.exp(self.A_log.float())                             # (H,)
+        A = -torch.exp(self.A_log.float())
         D = self.D.float()
         dt_bias = self.dt_proj.bias.float()
 
-        # Chunked SSD with per-chunk T_state
         outputs = []
         h = None
         inp_dtype = x.dtype
@@ -194,14 +182,13 @@ class _CausalMamba2Block(nn.Module):
             )
             y_ch = rearrange(y_ch, "b l h p -> b (h p) l").contiguous()
 
-            # T_state: per-head chunk-mean input
             chunk_feat_ph = y_ch.view(B, self.n_heads, self.d_head, cs).mean(dim=-1).float()
             h = self._apply_T_state(h, chunk_feat_ph)
 
             outputs.append(y_ch)
 
-        y = torch.cat(outputs, dim=2)                                  # (B, d_inner, L)
-        y = y * self.act(rearrange(z, "b d l -> b d l"))               # gate
+        y = torch.cat(outputs, dim=2)
+        y = y * self.act(rearrange(z, "b d l -> b d l"))
         y = rearrange(y, "b d l -> b l d")
         y = self.norm_pre_out(y)
         y = self.out_proj(y)
@@ -211,14 +198,13 @@ class _CausalMamba2Block(nn.Module):
         return out
 
     def step(self, x, conv_state, ssm_state, y_sum, frame_in_chunk):
-        """Single-frame step. x: (B, d_model). States updated in-place where applicable."""
+        """Single-frame step. ``x``: (B, d_model). States updated in place."""
         dtype = x.dtype
         residual = x
         x_norm = self.norm(x)
         xz = self.in_proj(x_norm)
-        x_in, z = xz.chunk(2, dim=-1)                                  # (B, d_inner) each
+        x_in, z = xz.chunk(2, dim=-1)
 
-        # Conv update
         if causal_conv1d_update is None:
             conv_state[:, :, :-1] = conv_state[:, :, 1:].clone()
             conv_state[:, :, -1] = x_in
@@ -240,11 +226,11 @@ class _CausalMamba2Block(nn.Module):
             x_db, [self.dt_rank, self.ngroups * self.d_state, self.ngroups * self.d_state], dim=-1,
         )
         dt = F.linear(dt_raw, self.dt_proj.weight)
-        dt = F.softplus(dt.float() + self.dt_proj.bias.float())        # (B, H)
+        dt = F.softplus(dt.float() + self.dt_proj.bias.float())
 
         B = rearrange(B, "b (g n) -> b g n", g=self.ngroups)
         C = rearrange(C, "b (g n) -> b g n", g=self.ngroups)
-        # ngroups = n_heads → no repeat_interleave needed (already per-head)
+        # ngroups == n_heads — already per-head, no repeat_interleave needed.
         Bh, Ch = B, C
 
         A = -torch.exp(self.A_log.float())
@@ -256,9 +242,8 @@ class _CausalMamba2Block(nn.Module):
         ssm_state.mul_(rearrange(dA, "b h -> b h 1 1")).add_(dBx)
         y = torch.einsum("bhpn,bhn->bhp", ssm_state.to(dtype), Ch)
         y = y + D_head.view(1, self.n_heads, 1) * x_ssd
-        y = rearrange(y, "b h p -> b (h p)").contiguous()              # (B, d_inner)
+        y = rearrange(y, "b h p -> b (h p)").contiguous()
 
-        # Accumulate chunk sum + at chunk-end apply T_state
         pos = int(frame_in_chunk[0].item())
         y_sum.add_(y.to(y_sum.dtype))
         new_pos = (pos + 1) % self.chunk_size
@@ -271,7 +256,6 @@ class _CausalMamba2Block(nn.Module):
             y_sum.zero_()
         frame_in_chunk.fill_(new_pos)
 
-        # Gate + norm + out_proj
         out = y * self.act(z)
         out = self.norm_pre_out(out)
         out = self.out_proj(out)
@@ -374,16 +358,7 @@ class MambaHead(nn.Module):
 # ── Main model ────────────────────────────────────────────────────────────────
 
 class CausalSurgicalMamba(nn.Module):
-    """
-    Baseline: ConvNeXt backbone → SurgicalMamba blocks → MambaHead.
-
-    Pipeline per clip:
-      1. Visual backbone       — spatial features (B*T, d_visual)
-      2. Visual projector      — d_visual → d_model
-      3. _HybridBlock × N      — SurgicalMamba + FFN (slow SSM carries across clips)
-      4. frame_norm
-      5. MambaHead             — per-frame logits
-    """
+    """ConvNeXt backbone → visual projector → SurgicalMamba blocks → MambaHead."""
 
     def __init__(
         self,
@@ -475,21 +450,18 @@ class CausalSurgicalMamba(nn.Module):
         )
 
 
-    # ── Per-clip forward ──────────────────────────────────────────────────────
-
     def forward_clip(self, frames, slow_states=None):
-        """
-        Process one T-frame clip.
+        """Process one T-frame clip.
 
         Args:
-            frames:          (B, T, 3, H, W)
-            slow_states:     list of (ssm_state, conv_state) per block, or None.
+            frames:      (B, T, 3, H, W) input clip.
+            slow_states: per-block list of (ssm_state, conv_state), or None.
 
         Returns:
-            logits             (B, T, num_phases)
-            new_slow_states    list of (ssm_state, conv_state) per block
-            frame_hidden       (B, T, d) detached
-            lambdas            list of intensity λ logits per layer
+            logits:          (B, T, num_phases) per-frame phase logits.
+            new_slow_states: per-block list carried to the next clip.
+            frame_hidden:    (B, T, d_model) detached penultimate features.
+            lambdas:         list of (B, T) intensity logits per layer.
         """
         B, T, C, H, W = frames.shape
 
@@ -548,10 +520,10 @@ class CausalSurgicalMamba(nn.Module):
 # ── Online frame-by-frame inference ───────────────────────────────────────────
 
 class OnlineSession:
-    """
-    Frame-by-frame online inference for CausalSurgicalMamba.
+    """Frame-by-frame online inference for CausalSurgicalMamba.
 
-    Slow SSM states carry across clips; fast states reset at TBPTT boundary.
+    Slow SSM state and fast conv state carry across clips; fast SSM and head
+    states reset at the end of every clip (matches training).
     """
 
     def __init__(self, model, clip_len=128, device=None, dtype=None,
@@ -584,32 +556,26 @@ class OnlineSession:
             else:
                 logit = self._step_impl(frame)
 
-        # Clip boundary management (outside graph)
         self._frame_idx += 1
         if self._frame_idx >= self.clip_len:
             self._frame_idx = 0
             self._end_of_clip()
-            # Invalidate CUDA graph after reset — state addresses unchanged
-            # but values are zeroed, graph will pick up on next replay.
 
         return logit
 
     def _step_cuda_graph(self, frame):
         if self._graph is None:
-            # Warmup run (populates CUDA caches)
+            # Warmup populates CUDA caches; capture must start from zeroed state.
             self._graph_input = torch.empty_like(frame)
             self._graph_input.copy_(frame)
             _ = self._step_impl(self._graph_input)
 
-            # Reset states after warmup so capture starts clean
             self._reset_all_states_inplace()
 
-            # Capture
             self._graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(self._graph):
                 self._graph_output = self._step_impl(self._graph_input)
 
-            # Reset again so first real step starts from zero
             self._reset_all_states_inplace()
             self._frame_idx = 0
 
@@ -618,7 +584,7 @@ class OnlineSession:
         return self._graph_output.clone()
 
     def _step_impl(self, frame):
-        """Pure compute — no Python branching, CUDA-graph safe."""
+        """Pure compute path — CUDA-graph safe (no Python branching)."""
         m = self.model
 
         f = m.extractor(frame)
@@ -640,30 +606,27 @@ class OnlineSession:
         return logit
 
     def _zero_states(self):
+        # ssm tuple = (ssm_fast, ssm_slow, y_sum_slow, y_sum_fast, frame_in_chunk).
         states = []
         for block in self.model.blocks:
             mb = block.mamba
             conv = torch.zeros(1, mb.d_inner * 2, mb.d_conv, device=self.device)
             ssm = (
-                torch.zeros(1, mb.n_heads_fast, mb.d_head_fast, mb.d_state, device=self.device),     # fast SSM
-                torch.zeros(1, mb.n_heads_slow, mb.d_head_slow, mb.d_state_slow, device=self.device), # slow SSM
-                torch.zeros(1, mb.d_inner, device=self.device),                                       # y_sum_slow
-                torch.zeros(1, mb.d_inner, device=self.device),                                       # y_sum_fast
-                torch.zeros(1, device=self.device, dtype=torch.long),                                 # frame_in_chunk
+                torch.zeros(1, mb.n_heads_fast, mb.d_head_fast, mb.d_state, device=self.device),
+                torch.zeros(1, mb.n_heads_slow, mb.d_head_slow, mb.d_state_slow, device=self.device),
+                torch.zeros(1, mb.d_inner, device=self.device),
+                torch.zeros(1, mb.d_inner, device=self.device),
+                torch.zeros(1, device=self.device, dtype=torch.long),
             )
             states.append((conv, ssm))
         return states
 
     def _zero_head_states(self, in_place=False):
         if in_place and hasattr(self, '_head_conv_states'):
-            for c in self._head_conv_states:
-                c.zero_()
-            for s in self._head_ssm_states:
-                s.zero_()
-            for y in self._head_y_sums:
-                y.zero_()
-            for f in self._head_frame_in_chunks:
-                f.zero_()
+            for lst in (self._head_conv_states, self._head_ssm_states,
+                        self._head_y_sums, self._head_frame_in_chunks):
+                for t in lst:
+                    t.zero_()
             return (self._head_conv_states, self._head_ssm_states,
                     self._head_y_sums, self._head_frame_in_chunks)
         return self.model.output_head.allocate_inference_cache(
@@ -671,12 +634,12 @@ class OnlineSession:
         )
 
     def _reset_all_states_inplace(self):
-        """Zero ALL states in-place (conv, fast SSM, slow SSM, head). For CUDA graph init."""
+        """Zero every state in place (conv, fast+slow SSM, head). For CUDA-graph init."""
         for i, block in enumerate(self.model.blocks):
             conv, ssm = self._block_states[i]
             conv.zero_()
             for s in ssm:
-                s.zero_()                      # fast/slow SSM, y_sum_slow/fast, frame_in_chunk
+                s.zero_()
         for c in self._head_conv_states:
             c.zero_()
         for s in self._head_ssm_states:
@@ -687,19 +650,15 @@ class OnlineSession:
             f.zero_()
 
     def _reset_fast_states(self):
+        # Fast conv + fast SSM reset per clip (matches training: zero-padded
+        # conv1d, fresh fast scan). Slow conv, slow SSM, y_sums and the
+        # chunk-position counter carry across clips.
         for i, block in enumerate(self.model.blocks):
             mb = block.mamba
             conv, ssm = self._block_states[i]
-            d = mb.d_inner
-            # Fast conv resets per clip (training uses zero-padded conv1d each clip)
-            conv[:, :d, :].zero_()
-            # Slow conv carries (training uses conv_init).
-            ssm[0].zero_()                    # fast SSM
-            # ssm[1] (slow SSM) preserved — carries across clips
-            # ssm[2] (y_sum_slow), ssm[3] (y_sum_fast), ssm[4] (frame_in_chunk) preserved
+            conv[:, :mb.d_inner, :].zero_()
+            ssm[0].zero_()
 
     def _end_of_clip(self):
-        # Match training: every clip resets fast SSM and head.
-        # Slow SSM and fast conv carry across the entire video.
         self._reset_fast_states()
         self._zero_head_states(in_place=True)
