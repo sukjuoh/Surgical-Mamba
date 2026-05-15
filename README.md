@@ -73,15 +73,14 @@ ConvNeXt-Tiny → visual projector → SurgicalMamba × N → MambaHead → per-
 
 ## Pretrained checkpoints
 
-Released weights (state-dict only):
+Released weights (state-dict only) — available under
+[Releases](https://github.com/sukjuoh/Surgical-Mamba/releases/tag/v1.0):
 
-| Dataset | Phases | File |
+| Dataset | Phases | Download |
 | --- | --- | --- |
-| Cholec80 | 7 | `cholec80_release.pt` |
-| M2CAI16 | 8 | `m2cai16_release.pt` |
-| AutoLaparo | 7 | `autolaparo_release.pt` |
-
-Download links: TBD.
+| Cholec80 | 7 | [cholec80_release.pt](https://github.com/sukjuoh/Surgical-Mamba/releases/download/v1.0/cholec80_release.pt) |
+| M2CAI16 | 8 | [m2cai16_release.pt](https://github.com/sukjuoh/Surgical-Mamba/releases/download/v1.0/m2cai16_release.pt) |
+| AutoLaparo | 7 | [autolaparo_release.pt](https://github.com/sukjuoh/Surgical-Mamba/releases/download/v1.0/autolaparo_release.pt) |
 
 Load and run online inference:
 
