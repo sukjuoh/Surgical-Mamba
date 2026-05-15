@@ -100,5 +100,12 @@ for frame in stream:               # frame: (3, H, W) tensor
 ## Citation
 
 ```
-TBD
+@misc{oh2026surgicalmamba,
+  title={SurgicalMamba: Dual-Path SSD with State Regramming for Online Surgical Phase Recognition},
+  author={Oh, Sukju and Sun, Sukkyu},
+  year={2026},
+  eprint={2605.14889},
+  archivePrefix={arXiv},
+  primaryClass={cs.CV}
+}
 ```
