@@ -522,20 +522,35 @@ class OnlineSession:
 
     Slow SSM state and fast conv state carry across clips; fast SSM and head
     states reset at the end of every clip (matches training).
+
+    With ``use_cuda_graph=True`` the normal per-frame path is captured into a
+    CUDA graph and replayed; frames that land on a chunk boundary (block or
+    head) run eager, since the per-chunk Cayley T_state is a different kernel
+    sequence. Most frames hit the fast graph replay.
     """
 
-    def __init__(self, model, clip_len=128, device=None, dtype=None):
+    def __init__(self, model, clip_len=128, device=None, dtype=None,
+                 use_cuda_graph=False):
         self.model    = model.eval()
         self.clip_len = clip_len
-        self.device   = device or next(model.parameters()).device
+        self.device   = torch.device(device) if device is not None \
+            else next(model.parameters()).device
         self.dtype    = dtype
+        self.use_cuda_graph = use_cuda_graph
+        if use_cuda_graph and self.device.type != "cuda":
+            raise ValueError("use_cuda_graph=True requires a CUDA device.")
+        self._graph = None
+        self._graph_input = None
+        self._graph_output = None
         self.reset()
 
     def reset(self):
-        self._frame_idx        = 0
-        self._block_states     = self._zero_states()
+        self._frame_idx    = 0
+        self._global_pos   = 0   # frames since session start (block chunk counter)
+        self._block_states = self._zero_states()
         (self._head_conv_states, self._head_ssm_states,
          self._head_y_sums, self._head_frame_in_chunks) = self._zero_head_states()
+        self._graph = None       # state tensors reallocated → old graph invalid
 
     @torch.no_grad()
     def step(self, frame):
@@ -543,14 +558,74 @@ class OnlineSession:
             frame = frame.unsqueeze(0)
         frame = frame.to(self.device)
         with torch.autocast("cuda", dtype=self.dtype, enabled=self.dtype is not None):
-            logit = self._step_impl(frame)
+            if self.use_cuda_graph:
+                logit = self._step_cuda_graph(frame)
+            else:
+                logit = self._step_impl(frame)
 
-        self._frame_idx += 1
+        self._frame_idx  += 1
+        self._global_pos += 1
         if self._frame_idx >= self.clip_len:
             self._frame_idx = 0
             self._end_of_clip()
 
         return logit
+
+    def _step_cuda_graph(self, frame):
+        cs_block = self.model.blocks[0].mamba.chunk_size_slow
+        cs_head  = self.model.output_head.blocks[0].chunk_size
+
+        if self._graph is None:
+            # Warmup triggers Triton / cuDNN autotuning (which syncs — illegal
+            # during capture). State is then zeroed so capture starts clean.
+            self._graph_input = torch.empty_like(frame)
+            self._graph_input.copy_(frame)
+            _ = self._step_impl(self._graph_input)
+            self._reset_all_states_inplace()
+
+            # Capture the normal path: counters are 0, so no chunk-end branch.
+            self._graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(self._graph):
+                self._graph_output = self._step_impl(self._graph_input)
+
+            self._reset_all_states_inplace()
+            self._frame_idx  = 0
+            self._global_pos = 0
+
+        # A chunk boundary for the block (carries across clips) or the head
+        # (resets each clip) needs the eager Cayley T_state path.
+        block_end = (self._global_pos % cs_block) == (cs_block - 1)
+        head_end  = (self._frame_idx  % cs_head)  == (cs_head - 1)
+        if block_end or head_end:
+            self._sync_counters()
+            return self._step_impl(frame)
+
+        self._graph_input.copy_(frame)
+        self._graph.replay()
+        return self._graph_output.clone()
+
+    def _sync_counters(self):
+        """Resync host-side chunk counters before an eager step — graph
+        replays advance neither the block nor the head counter."""
+        cs_block = self.model.blocks[0].mamba.chunk_size_slow
+        cs_head  = self.model.output_head.blocks[0].chunk_size
+        block_pos = self._global_pos % cs_block
+        head_pos  = self._frame_idx  % cs_head
+        for i, (conv, ssm) in enumerate(self._block_states):
+            self._block_states[i] = (conv, (*ssm[:4], block_pos))
+        self._head_frame_in_chunks = [head_pos] * len(self._head_frame_in_chunks)
+
+    def _reset_all_states_inplace(self):
+        """Zero every state tensor in place and reset host-side counters."""
+        for i, (conv, ssm) in enumerate(self._block_states):
+            conv.zero_()
+            for s in ssm[:4]:
+                s.zero_()
+            self._block_states[i] = (conv, (*ssm[:4], 0))
+        for lst in (self._head_conv_states, self._head_ssm_states, self._head_y_sums):
+            for t in lst:
+                t.zero_()
+        self._head_frame_in_chunks = [0] * len(self._head_frame_in_chunks)
 
     def _step_impl(self, frame):
         m = self.model
