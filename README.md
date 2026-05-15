@@ -100,12 +100,13 @@ for frame in stream:               # frame: (3, H, W) tensor
 ## Citation
 
 ```
-@misc{oh2026surgicalmamba,
-  title={SurgicalMamba: Dual-Path SSD with State Regramming for Online Surgical Phase Recognition},
-  author={Oh, Sukju and Sun, Sukkyu},
-  year={2026},
-  eprint={2605.14889},
-  archivePrefix={arXiv},
-  primaryClass={cs.CV}
+@misc{oh2026surgicalmambadualpathssdstate,
+      title={SurgicalMamba: Dual-Path SSD with State Regramming for Online Surgical Phase Recognition}, 
+      author={Sukju Oh and Sukkyu Sun},
+      year={2026},
+      eprint={2605.14889},
+      archivePrefix={arXiv},
+      primaryClass={cs.CV},
+      url={https://arxiv.org/abs/2605.14889}, 
 }
 ```
