@@ -28,7 +28,6 @@ from torch.utils.data import DataLoader
 sys.path.insert(0, os.path.dirname(__file__))
 
 from models import CausalSurgicalMamba
-from models.causal_surgical_mamba import OnlineSession
 from data.dataset import VideoClipDataset
 
 

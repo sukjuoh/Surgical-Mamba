@@ -541,7 +541,9 @@ class SurgicalMamba(nn.Module):
         Args:
             conv_state: (B, 2*d_inner, d_conv) — fast||slow packed.
             ssm_state:  5-tuple (ssm_fast, ssm_slow, y_sum_slow, y_sum_fast,
-                        frame_in_chunk).
+                        frame_in_chunk). ``frame_in_chunk`` is a Python int
+                        (host-side counter — keeps the per-frame step path
+                        free of GPU→CPU syncs).
             lower_mem:  unused (kept for API back-compat).
         """
         dtype = hidden_states.dtype
@@ -611,8 +613,11 @@ class SurgicalMamba(nn.Module):
         B = rearrange(B, "b (g n) -> b g n", g=G)
         C = rearrange(C, "b (g n) -> b g n", g=G)
         heads_per_group = H // G
-        Bh = B.repeat_interleave(heads_per_group, dim=1)
-        Ch = C.repeat_interleave(heads_per_group, dim=1)
+        if heads_per_group == 1:
+            Bh, Ch = B, C
+        else:
+            Bh = B.repeat_interleave(heads_per_group, dim=1)
+            Ch = C.repeat_interleave(heads_per_group, dim=1)
 
         A_fast = -torch.exp(self.A_log_fast.float())
         D_head = self.D_fast.to(dtype)
@@ -625,37 +630,36 @@ class SurgicalMamba(nn.Module):
         y = y + D_head.view(1, H, 1) * x_ssd
         y = rearrange(y, "b h p -> b (h p)").contiguous()
 
-        # frame_in_chunk is advanced by slow step; post-advance pos==0 marks
-        # chunk-end. Accumulate y each frame, mix via T_state at chunk-end.
+        # frame_in_chunk (Python int) is advanced by the slow step; a post-advance
+        # value of 0 marks a chunk boundary. Accumulate y each frame, mix via
+        # T_state at chunk-end.
         if y_sum is not None:
             y_sum.add_(y.to(y_sum.dtype))
-        if frame_in_chunk is not None:
-            pos_advanced = int(frame_in_chunk[0].item())
-            if pos_advanced == 0:
-                chunk_size = self.chunk_size_fast
-                r_f = self.T_rank
-                n_f = self.d_state
-                B_ = y.shape[0]
-                chunk_mean = (y_sum / chunk_size).float() if y_sum is not None else y.float()
-                chunk_feat_ph = chunk_mean.view(B_, H, P)
-                chunk_feat_ph = F.layer_norm(chunk_feat_ph, [P])
-                UV_flat = self.UV_mlp_fast(chunk_feat_ph)
-                U_flat, V_flat = UV_flat.chunk(2, dim=-1)
-                U = F.normalize(U_flat.view(B_, H, n_f, r_f), dim=-2)
-                V = F.normalize(V_flat.view(B_, H, n_f, r_f), dim=-2)
-                sigma_logit = self.S_mlp_fast(chunk_feat_ph)
-                with torch.amp.autocast("cuda", enabled=False):
-                    sigma = F.softplus(sigma_logit.float())
-                    UV = torch.einsum("bhnr,bhr,bhmr->bhnm", U.float(), sigma, V.float())
-                    S = UV - UV.transpose(-2, -1)
-                    I_S = torch.eye(n_f, device=S.device, dtype=S.dtype).expand_as(S)
-                    S_half = S * 0.5
-                    M = torch.linalg.solve(I_S - S_half, I_S + S_half)
-                    ssm_state.copy_(
-                        torch.einsum("bhpn,bhnm->bhpm", ssm_state.float(), M).to(ssm_state.dtype)
-                    )
-                if y_sum is not None:
-                    y_sum.zero_()
+        if frame_in_chunk is not None and frame_in_chunk == 0:
+            chunk_size = self.chunk_size_fast
+            r_f = self.T_rank
+            n_f = self.d_state
+            B_ = y.shape[0]
+            chunk_mean = (y_sum / chunk_size).float() if y_sum is not None else y.float()
+            chunk_feat_ph = chunk_mean.view(B_, H, P)
+            chunk_feat_ph = F.layer_norm(chunk_feat_ph, [P])
+            UV_flat = self.UV_mlp_fast(chunk_feat_ph)
+            U_flat, V_flat = UV_flat.chunk(2, dim=-1)
+            U = F.normalize(U_flat.view(B_, H, n_f, r_f), dim=-2)
+            V = F.normalize(V_flat.view(B_, H, n_f, r_f), dim=-2)
+            sigma_logit = self.S_mlp_fast(chunk_feat_ph)
+            with torch.amp.autocast("cuda", enabled=False):
+                sigma = F.softplus(sigma_logit.float())
+                UV = torch.einsum("bhnr,bhr,bhmr->bhnm", U.float(), sigma, V.float())
+                S = UV - UV.transpose(-2, -1)
+                I_S = torch.eye(n_f, device=S.device, dtype=S.dtype).expand_as(S)
+                S_half = S * 0.5
+                M = torch.linalg.solve(I_S - S_half, I_S + S_half)
+                ssm_state.copy_(
+                    torch.einsum("bhpn,bhnm->bhpm", ssm_state.float(), M).to(ssm_state.dtype)
+                )
+            if y_sum is not None:
+                y_sum.zero_()
 
         return y, y_sum
 
@@ -697,8 +701,11 @@ class SurgicalMamba(nn.Module):
         B = rearrange(B, "b (g n) -> b g n", g=G)
         C = rearrange(C, "b (g n) -> b g n", g=G)
         heads_per_group = H // G
-        Bh = B.repeat_interleave(heads_per_group, dim=1)
-        Ch = C.repeat_interleave(heads_per_group, dim=1)
+        if heads_per_group == 1:
+            Bh, Ch = B, C
+        else:
+            Bh = B.repeat_interleave(heads_per_group, dim=1)
+            Ch = C.repeat_interleave(heads_per_group, dim=1)
 
         A_slow = -torch.exp(self.A_log_slow.float())
         D_head = self.D_slow.to(dtype)
@@ -715,7 +722,7 @@ class SurgicalMamba(nn.Module):
         y = rearrange(y, "b h p -> b (h p)").contiguous()
 
         chunk_size = self.chunk_size_slow
-        pos = int(frame_in_chunk[0].item()) if frame_in_chunk is not None else 0
+        pos = frame_in_chunk if frame_in_chunk is not None else 0
         if y_sum is not None:
             y_sum.add_(y.to(y_sum.dtype))
         new_pos = (pos + 1) % chunk_size
@@ -746,7 +753,5 @@ class SurgicalMamba(nn.Module):
                 )
             if y_sum is not None:
                 y_sum.zero_()
-        if frame_in_chunk is not None:
-            frame_in_chunk.fill_(new_pos)
 
-        return y, y_sum, frame_in_chunk, lam_logit
+        return y, y_sum, new_pos, lam_logit

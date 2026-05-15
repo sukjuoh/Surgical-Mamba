@@ -198,7 +198,8 @@ class _CausalMamba2Block(nn.Module):
         return out
 
     def step(self, x, conv_state, ssm_state, y_sum, frame_in_chunk):
-        """Single-frame step. ``x``: (B, d_model). States updated in place."""
+        """Single-frame step. ``x``: (B, d_model). Tensor states are updated in
+        place; ``frame_in_chunk`` is a Python int returned updated."""
         dtype = x.dtype
         residual = x
         x_norm = self.norm(x)
@@ -244,9 +245,8 @@ class _CausalMamba2Block(nn.Module):
         y = y + D_head.view(1, self.n_heads, 1) * x_ssd
         y = rearrange(y, "b h p -> b (h p)").contiguous()
 
-        pos = int(frame_in_chunk[0].item())
         y_sum.add_(y.to(y_sum.dtype))
-        new_pos = (pos + 1) % self.chunk_size
+        new_pos = (frame_in_chunk + 1) % self.chunk_size
         if new_pos == 0:
             chunk_mean = (y_sum / self.chunk_size).float()
             chunk_feat_ph = chunk_mean.view(y.shape[0], self.n_heads, self.d_head)
@@ -254,14 +254,13 @@ class _CausalMamba2Block(nn.Module):
                 self._apply_T_state(ssm_state.float(), chunk_feat_ph).to(ssm_state.dtype)
             )
             y_sum.zero_()
-        frame_in_chunk.fill_(new_pos)
 
         out = y * self.act(z)
         out = self.norm_pre_out(out)
         out = self.out_proj(out)
         out = residual + self.drop(out)
         out = out + self.drop(self.ffn(self.ffn_norm(out)))
-        return out, conv_state, ssm_state, y_sum, frame_in_chunk
+        return out, conv_state, ssm_state, y_sum, new_pos
 
     def allocate_inference_cache(self, batch_size, device=None, dtype=None):
         device = device or next(self.parameters()).device
@@ -271,8 +270,7 @@ class _CausalMamba2Block(nn.Module):
         ssm  = torch.zeros(batch_size, self.n_heads, self.d_head, self.d_state,
                            device=device, dtype=dt)
         y_sum = torch.zeros(batch_size, self.d_inner, device=device, dtype=dt)
-        frame_in_chunk = torch.zeros(batch_size, device=device, dtype=torch.long)
-        return conv, ssm, y_sum, frame_in_chunk
+        return conv, ssm, y_sum, 0
 
 
 class _HybridBlock(nn.Module):
@@ -526,16 +524,11 @@ class OnlineSession:
     states reset at the end of every clip (matches training).
     """
 
-    def __init__(self, model, clip_len=128, device=None, dtype=None,
-                 use_cuda_graph=False):
+    def __init__(self, model, clip_len=128, device=None, dtype=None):
         self.model    = model.eval()
         self.clip_len = clip_len
         self.device   = device or next(model.parameters()).device
         self.dtype    = dtype
-        self.use_cuda_graph = use_cuda_graph
-        self._graph  = None
-        self._graph_input  = None
-        self._graph_output = None
         self.reset()
 
     def reset(self):
@@ -543,7 +536,6 @@ class OnlineSession:
         self._block_states     = self._zero_states()
         (self._head_conv_states, self._head_ssm_states,
          self._head_y_sums, self._head_frame_in_chunks) = self._zero_head_states()
-        self._graph = None
 
     @torch.no_grad()
     def step(self, frame):
@@ -551,10 +543,7 @@ class OnlineSession:
             frame = frame.unsqueeze(0)
         frame = frame.to(self.device)
         with torch.autocast("cuda", dtype=self.dtype, enabled=self.dtype is not None):
-            if self.use_cuda_graph:
-                logit = self._step_cuda_graph(frame)
-            else:
-                logit = self._step_impl(frame)
+            logit = self._step_impl(frame)
 
         self._frame_idx += 1
         if self._frame_idx >= self.clip_len:
@@ -563,28 +552,7 @@ class OnlineSession:
 
         return logit
 
-    def _step_cuda_graph(self, frame):
-        if self._graph is None:
-            # Warmup populates CUDA caches; capture must start from zeroed state.
-            self._graph_input = torch.empty_like(frame)
-            self._graph_input.copy_(frame)
-            _ = self._step_impl(self._graph_input)
-
-            self._reset_all_states_inplace()
-
-            self._graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(self._graph):
-                self._graph_output = self._step_impl(self._graph_input)
-
-            self._reset_all_states_inplace()
-            self._frame_idx = 0
-
-        self._graph_input.copy_(frame)
-        self._graph.replay()
-        return self._graph_output.clone()
-
     def _step_impl(self, frame):
-        """Pure compute path — CUDA-graph safe (no Python branching)."""
         m = self.model
 
         f = m.extractor(frame)
@@ -616,7 +584,7 @@ class OnlineSession:
                 torch.zeros(1, mb.n_heads_slow, mb.d_head_slow, mb.d_state_slow, device=self.device),
                 torch.zeros(1, mb.d_inner, device=self.device),
                 torch.zeros(1, mb.d_inner, device=self.device),
-                torch.zeros(1, device=self.device, dtype=torch.long),
+                0,  # frame_in_chunk — host-side counter
             )
             states.append((conv, ssm))
         return states
@@ -624,30 +592,15 @@ class OnlineSession:
     def _zero_head_states(self, in_place=False):
         if in_place and hasattr(self, '_head_conv_states'):
             for lst in (self._head_conv_states, self._head_ssm_states,
-                        self._head_y_sums, self._head_frame_in_chunks):
+                        self._head_y_sums):
                 for t in lst:
                     t.zero_()
+            self._head_frame_in_chunks = [0] * len(self._head_frame_in_chunks)
             return (self._head_conv_states, self._head_ssm_states,
                     self._head_y_sums, self._head_frame_in_chunks)
         return self.model.output_head.allocate_inference_cache(
             1, device=self.device,
         )
-
-    def _reset_all_states_inplace(self):
-        """Zero every state in place (conv, fast+slow SSM, head). For CUDA-graph init."""
-        for i, block in enumerate(self.model.blocks):
-            conv, ssm = self._block_states[i]
-            conv.zero_()
-            for s in ssm:
-                s.zero_()
-        for c in self._head_conv_states:
-            c.zero_()
-        for s in self._head_ssm_states:
-            s.zero_()
-        for y in self._head_y_sums:
-            y.zero_()
-        for f in self._head_frame_in_chunks:
-            f.zero_()
 
     def _reset_fast_states(self):
         # Fast conv + fast SSM reset per clip (matches training: zero-padded
