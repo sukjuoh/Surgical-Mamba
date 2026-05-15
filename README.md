@@ -88,7 +88,8 @@ Load and run online inference:
 import torch
 from models import CausalSurgicalMamba, OnlineSession
 
-# and CausalSurgicalMamba(num_phases=7) respectively.
+# Cholec80 uses block fast/slow chunk 64. M2CAI16 / AutoLaparo use the
+# defaults — CausalSurgicalMamba(num_phases=8) / CausalSurgicalMamba(num_phases=7).
 model = CausalSurgicalMamba(
     num_phases=7,
     chunk_size_fast_block=64,
