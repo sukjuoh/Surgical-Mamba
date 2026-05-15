@@ -88,12 +88,9 @@ Load and run online inference:
 import torch
 from models import CausalSurgicalMamba, OnlineSession
 
-# Cholec80 checkpoint architecture: head chunk 32, block fast/slow chunk 64.
-# M2CAI16 / AutoLaparo use the defaults — CausalSurgicalMamba(num_phases=8)
 # and CausalSurgicalMamba(num_phases=7) respectively.
 model = CausalSurgicalMamba(
     num_phases=7,
-    head_chunk_size=32,
     chunk_size_fast_block=64,
     chunk_size_slow_block=64,
 ).eval().cuda()
