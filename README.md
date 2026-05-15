@@ -88,10 +88,19 @@ Load and run online inference:
 import torch
 from models import CausalSurgicalMamba, OnlineSession
 
-model = CausalSurgicalMamba(num_phases=7).eval().cuda()  # 8 for M2CAI16
+# Cholec80 checkpoint architecture: head chunk 32, block fast/slow chunk 64.
+# M2CAI16 / AutoLaparo use the defaults — CausalSurgicalMamba(num_phases=8)
+# and CausalSurgicalMamba(num_phases=7) respectively.
+model = CausalSurgicalMamba(
+    num_phases=7,
+    head_chunk_size=32,
+    chunk_size_fast_block=64,
+    chunk_size_slow_block=64,
+).eval().cuda()
 model.load_state_dict(torch.load("cholec80_release.pt")["model"])
 
-session = OnlineSession(model, clip_len=128, device="cuda")
+# use_cuda_graph=True replays a captured graph (~1.8x faster per-frame stepping).
+session = OnlineSession(model, clip_len=128, device="cuda", use_cuda_graph=True)
 for frame in stream:               # frame: (3, H, W) tensor
     logits = session.step(frame)
 ```

@@ -367,7 +367,7 @@ class CausalSurgicalMamba(nn.Module):
         grad_checkpointing:        bool  = False,
         d_model:                   int   = 768,
         n_layers:                  int   = 4,
-        d_state:                   int   = 16,
+        d_state:                   int   = 64,
         d_state_slow:              int   = None,
         d_conv:                    int   = 4,
         expand:                    int   = 2,
