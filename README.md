@@ -57,9 +57,8 @@ full argparse listing.
 ## Evaluation
 
 Phase-recognition metrics (per-video accuracy, precision, recall, Jaccard)
-follow the MATLAB evaluation protocol from
-[TMRNet](https://github.com/YuemingJin/TMRNet/tree/main/code/eval) —
-`Main.m` for Cholec80 / AutoLaparo and `Main_m2cai.m` for M2CAI16.
+follow the 10-second relaxed-boundary protocol commonly used in
+Cholec80 / M2CAI16 phase-recognition literature.
 
 ## Model
 
