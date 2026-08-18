@@ -457,7 +457,7 @@ class SurgicalMamba(nn.Module):
         )
         # Scalar intensity λ(t) per frame, applied as dt modulation.
         if getattr(self, "intensity_net", None) is not None:
-            lam_logit = self.intensity_net(x_conv_flat)
+            lam_logit = self.intensity_net(x_conv_flat.detach())  # λ probe: no grad into shared features
             lam_logit = rearrange(lam_logit, "(b l) 1 -> b l 1", l=seqlen)
             lam = torch.sigmoid(lam_logit)
             lam_logit_seq = lam_logit.squeeze(-1)
