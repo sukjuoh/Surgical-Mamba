@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# M2CAI16-workflow — official split: train workflow_video_01..27, test test_workflow_video_01..14.
+# M2CAI16-workflow — official split: train workflow_video_01..27, test test_workflow_video_01..14
+# (architecture development: train workflow_video_01..20, val workflow_video_21..27).
+# Reported results use the last-epoch checkpoint (latest_causal.pt).
 # Chunk sizes: head=32, fast=32, slow=32.
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
 

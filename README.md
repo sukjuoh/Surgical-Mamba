@@ -35,10 +35,17 @@ ffmpeg -hide_banner -i <video>.mp4 -r 1 -start_number 0 \
 Helpers are in [`data/`](data/): `preprocess_videos.py`,
 `video2frame_cutmargin.py`.
 
-Standard public splits are hardcoded in [`train.py`](train.py) under
-`DATASET_SPLITS` — Cholec80 (40 train / 40 test), M2CAI16 (27 train / 14 test,
-official split with `workflow_video_*` and `test_workflow_video_*` tags), and
-AutoLaparo (10 / 4 / 7).
+Splits are hardcoded in [`train.py`](train.py) under `DATASET_SPLITS`.
+During architecture development, part of the training set was held out for
+validation: Cholec80 32 train / 8 val (videos 1–32 / 33–40) and M2CAI16
+20 train / 7 val (`workflow_video_01–20` / `21–27`). After the architecture
+was fixed, final results were obtained with the standard splits: Cholec80
+(40 train / 40 test), M2CAI16 (27 train / 14 test, official split with
+`workflow_video_*` and `test_workflow_video_*` tags), and AutoLaparo
+(10 train / 4 val / 7 test).
+
+No checkpoint selection is performed: all reported results use the
+last-epoch checkpoint (`latest_causal.pt`).
 
 ## Training
 
@@ -100,18 +107,4 @@ model.load_state_dict(torch.load("cholec80_release.pt")["model"])
 session = OnlineSession(model, clip_len=128, device="cuda", use_cuda_graph=True)
 for frame in stream:               # frame: (3, H, W) tensor
     logits = session.step(frame)
-```
-
-## Citation
-
-```
-@misc{oh2026surgicalmambadualpathssdstate,
-      title={SurgicalMamba: Dual-Path SSD with State Regramming for Online Surgical Phase Recognition}, 
-      author={Sukju Oh and Sukkyu Sun},
-      year={2026},
-      eprint={2605.14889},
-      archivePrefix={arXiv},
-      primaryClass={cs.CV},
-      url={https://arxiv.org/abs/2605.14889}, 
-}
 ```

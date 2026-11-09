@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Cholec80 — cuhk4040 split: train 1..40, val/test 41..80.
+# Cholec80 — standard split: train 1..40, test 41..80
+# (architecture development: train 1..32, val 33..40).
+# Reported results use the last-epoch checkpoint (latest_causal.pt).
 # Chunk sizes: head=32, fast=64, slow=64.
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
 

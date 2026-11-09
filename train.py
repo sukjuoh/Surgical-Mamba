@@ -631,7 +631,6 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--scheduler", default="cosine")
     p.add_argument("--save_dir", default="./checkpoints")
     p.add_argument("--log_interval", type=int, default=10)
-    p.add_argument("--patience", type=int, default=0)
     p.add_argument("--wandb_project", default="surgical-phase-mamba")
     p.add_argument("--wandb_run_name", default=None)
     return p
@@ -689,7 +688,6 @@ def _args_to_cfg(args) -> "OmegaConf":
             "scheduler":          args.scheduler,
             "save_dir":           args.save_dir,
             "log_interval":       args.log_interval,
-            "patience":           args.patience,
             "wandb_project":      args.wandb_project,
             "wandb_run_name":     args.wandb_run_name,
         },
@@ -738,9 +736,6 @@ def main():
     )
 
     os.makedirs(cfg.train.save_dir, exist_ok=True)
-    best_val_acc = -float("inf")
-    patience = cfg.train.get("patience", 0)
-    epochs_no_improve = 0
 
     for epoch in range(1, cfg.train.epochs + 1):
         model.train()
@@ -799,35 +794,16 @@ def main():
               f" | acc {train_acc:.4f} ===")
         wandb.log(log_dict)
 
-        mo = evaluate_val(model, cfg, device, epoch)
+        # Validation is logged for monitoring only; no checkpoint selection.
+        evaluate_val(model, cfg, device, epoch)
         model.train()
-
-        score = mo["acc"]
-        if score > best_val_acc:
-            best_val_acc = score
-            epochs_no_improve = 0
-            ckpt_path = os.path.join(cfg.train.save_dir, "best_causal.pt")
-            torch.save({"model": model.state_dict()}, ckpt_path)
-            print(f"  Saved best → {ckpt_path} (val acc={mo['acc']:.4f})")
-        else:
-            epochs_no_improve += 1
 
         torch.save({"model": model.state_dict()},
                    os.path.join(cfg.train.save_dir, "latest_causal.pt"))
 
-        if patience > 0 and epochs_no_improve >= patience:
-            print(f"\n[EARLY STOP] no val improvement for {patience} epochs "
-                  f"(best score={best_val_acc:.4f}). Halting at epoch {epoch}.")
-            break
-
-    # ── Final test evaluation on best (val-selected) checkpoint ───────────────
-    best_path = os.path.join(cfg.train.save_dir, "best_causal.pt")
-    if os.path.exists(best_path):
-        print(f"\nLoading best checkpoint for final test evaluation: {best_path}")
-        ckpt = torch.load(best_path, map_location=device)
-        model.load_state_dict(ckpt["model"])
-        test_mc = evaluate_test(model, cfg, device, epoch=0)
-        print(f"[FINAL TEST] test_acc={test_mc['acc']:.4f}")
+    # ── Final test evaluation on the last-epoch checkpoint ────────────────────
+    test_mc = evaluate_test(model, cfg, device, epoch=0)
+    print(f"[FINAL TEST] test_acc={test_mc['acc']:.4f}")
 
     wandb.finish()
     print("Training complete.")

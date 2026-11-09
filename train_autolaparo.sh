@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # AutoLaparo — TeCNO split: train 01..10, val 11..14, test 15..21.
+# Reported results use the last-epoch checkpoint (latest_causal.pt).
 # Chunk sizes: head=32, fast=32, slow=32.
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
 
